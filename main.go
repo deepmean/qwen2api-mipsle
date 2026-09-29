@@ -31,6 +31,9 @@ import (
 var (
 	currentConfig config
 	startTime     = time.Now()
+	// debugRawFrames dumps every upstream SSE frame verbatim. Enabled by
+	// LOG_LEVEL=DEBUG; it carries answer text, so it is off by default.
+	debugRawFrames bool
 )
 
 func main() {
@@ -39,6 +42,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	currentConfig = cfg
+	debugRawFrames = cfg.LogLevel == "DEBUG"
 	if cfg.AccountsFile == "" {
 		currentConfig.AccountsFile = "/opt/qwen2api/accounts.txt"
 	}
@@ -604,6 +608,9 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 		// A partial or non-JSON frame is not fatal on its own; skip it.
 		acc.sample(data)
 		return nil
+	}
+	if debugRawFrames {
+		log.Printf("chat: RAW %s", truncateForLog(data, 1200))
 	}
 
 	// Upstream reports business failures inside the stream, sometimes with HTTP
