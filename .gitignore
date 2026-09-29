@@ -12,3 +12,7 @@ qwen2api.conf
 # Go
 *.test
 *.out
+*.exe
+
+# Session transcript (working notes, not part of the project)
+context_qwenproxy.txt

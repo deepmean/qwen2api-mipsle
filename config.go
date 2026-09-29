@@ -35,17 +35,25 @@ type config struct {
 	// MaxConcurrent bounds in-flight chat requests. The device has ~80MB free
 	// RAM; each streamed answer costs a few hundred KB of buffers.
 	MaxConcurrent int
+	// PrefixCacheTTLSec bounds how long an uploaded history attachment may be
+	// reused. An expired Qwen file_id does not error — the model just answers
+	// without it — so reuse is capped by the document's own lifetime.
+	PrefixCacheTTLSec int
+	// PrefixCacheMaxEntries caps how many sessions' attachments are remembered.
+	PrefixCacheMaxEntries int
 	// LogLevel is one of DEBUG/INFO/WARN/ERROR.
 	LogLevel string
 }
 
 func defaultConfig() config {
 	return config{
-		ListenPort:        3000,
-		QwenChatBase:      "https://chat.qwen.ai",
-		RequestTimeoutSec: 600,
-		MaxConcurrent:     8,
-		LogLevel:          "INFO",
+		ListenPort:            3000,
+		QwenChatBase:          "https://chat.qwen.ai",
+		RequestTimeoutSec:     600,
+		MaxConcurrent:         8,
+		PrefixCacheTTLSec:     1800,
+		PrefixCacheMaxEntries: 8,
+		LogLevel:              "INFO",
 	}
 }
 
@@ -80,6 +88,18 @@ func loadConfig() (config, error) {
 		var n int
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			c.MaxConcurrent = n
+		}
+	}
+	if v := os.Getenv("AGENT_CONTEXT_PREFIX_TTL_SECONDS"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n >= 0 {
+			c.PrefixCacheTTLSec = n
+		}
+	}
+	if v := os.Getenv("AGENT_CONTEXT_PREFIX_MAX_ENTRIES"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			c.PrefixCacheMaxEntries = n
 		}
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {

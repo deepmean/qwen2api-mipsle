@@ -12,3 +12,9 @@ SERVICE_PORT=3000
 
 # DEBUG | INFO | WARN | ERROR
 LOG_LEVEL=INFO
+
+# How long an uploaded history attachment may be reused across turns, and how
+# many sessions to remember. The parse call is rate-limited by Qwen's WAF per
+# egress IP, so a longer TTL means fewer uploads.
+AGENT_CONTEXT_PREFIX_TTL_SECONDS=1800
+AGENT_CONTEXT_PREFIX_MAX_ENTRIES=8

@@ -60,7 +60,12 @@ func main() {
 		log.Printf("WARN: API_KEY is unset — /v1/* is open to anyone who can reach this port")
 	}
 
-	srv := &server{pool: p, client: client, sem: make(chan struct{}, currentConfig.MaxConcurrent)}
+	srv := &server{
+		pool:   p,
+		client: client,
+		sem:    make(chan struct{}, currentConfig.MaxConcurrent),
+		prefix: newPrefixCache(time.Duration(currentConfig.PrefixCacheTTLSec)*time.Second, currentConfig.PrefixCacheMaxEntries),
+	}
 
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", currentConfig.ListenPort),
@@ -94,6 +99,11 @@ type server struct {
 	// sem bounds concurrent chat requests. The router has ~80MB free RAM and
 	// each streamed answer holds its own buffers.
 	sem chan struct{}
+
+	// prefix caches uploaded history attachments so a parse covers many turns.
+	prefix *prefixCache
+	// breaker pauses uploads after the WAF repeatedly challenges the parse call.
+	breaker parseBreaker
 
 	// modelsMu guards the catalogue cache, which is refreshed at most once per
 	// modelCacheTTL so a chat request does not pay for a discovery round trip.
@@ -231,6 +241,9 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	Stream   *bool         `json:"stream"`
+	// System is the top-level system prompt some clients send instead of (or in
+	// addition to) a system message. Anthropic-shaped requests carry it here.
+	System json.RawMessage `json:"system"`
 	// EnableThinking / ThinkingBudget are Qwen extensions upstream supports.
 	EnableThinking *bool `json:"enable_thinking"`
 	ThinkingBudget int   `json:"thinking_budget"`
@@ -271,19 +284,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Log every inbound turn at entry. Without this, a request that never
 	// reaches the upstream is indistinguishable from one that was never sent,
 	// which is exactly the ambiguity that makes "empty reply" reports hard to
-	// diagnose.
-	//
-	// Read the body once so it can be logged before decoding: seeing exactly
-	// what the client sent is the difference between guessing and diagnosing.
+	// diagnose. The size is logged; the body itself is not, since it carries the
+	// user's prompts.
 	rawBody, err := readAllLimited(r.Body, 4<<20)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "could not read body: "+err.Error())
 		return
 	}
 	log.Printf("chat: <- %s %s (%d bytes) ua=%q", r.Method, r.URL.Path, len(rawBody), r.Header.Get("user-agent"))
-	if len(rawBody) > 0 {
-		log.Printf("chat: body %s", previewBody(rawBody, 2000))
-	}
 
 	var req chatRequest
 	dec := json.NewDecoder(bytes.NewReader(rawBody))
@@ -294,6 +302,12 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(req.Messages) == 0 {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "messages is required and must be non-empty")
 		return
+	}
+	// Fold a top-level `system` field into the conversation when the messages do
+	// not already start with one, so the system prompt is treated uniformly
+	// (kept inline and budgeted) regardless of which shape the client sent.
+	if len(req.System) > 0 && req.Messages[0].Role != "system" {
+		req.Messages = append([]chatMessage{{Role: "system", Content: req.System}}, req.Messages...)
 	}
 	model := req.Model
 	if model == "" {
@@ -320,18 +334,6 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Keep the body under the WAF's ~128 KiB ceiling. Agent clients resend their
-	// whole conversation each turn, so without this every turn past the limit is
-	// answered with a challenge (HTTP 200, no text).
-	if size := len(flattenMessages(req.Messages)); size > defaultUpstreamBudgetBytes {
-		compacted, dropped := compactMessages(req.Messages, defaultUpstreamBudgetBytes)
-		if dropped > 0 {
-			log.Printf("chat: compacted context %d -> %d messages (%d bytes -> %d bytes)",
-				len(req.Messages), len(compacted), size, len(flattenMessages(compacted)))
-			req.Messages = compacted
-		}
-	}
-
 	// Normalise the inbound name before anything else: clients decorate it with
 	// a `[..]` context marker and behavioural suffixes that upstream rejects.
 	resolved := resolveModel(model, s.cachedModels(), req.EnableThinking != nil && *req.EnableThinking)
@@ -348,6 +350,13 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("chat: model=%q resolved=%q chat_type=%s thinking=%v msgs=%d stream=%v",
 		model, resolved.ID, resolved.ChatType, resolved.Thinking, len(req.Messages), stream)
 
+	// Keep the body under the WAF's ~128 KiB ceiling. Agent clients resend their
+	// whole conversation each turn, so without this every turn past the limit is
+	// answered with a challenge (HTTP 200, no text). Prefer moving the history
+	// into a document attachment (lossless); fall back to compaction only when
+	// uploads are unavailable.
+	ext := s.externalizeContext(r.Context(), acct, req.Messages, resolved.ID)
+
 	chatID, err := s.client.createChatID(r.Context(), acct, resolved.ID, resolved.ChatType)
 	if err != nil {
 		var ue *upstreamError
@@ -359,7 +368,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, err := buildUpstreamPayload(req, resolved, chatID)
+	payload, err := buildUpstreamPayload(resolved, chatID, ext)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -712,11 +721,14 @@ func wafChallenge(root map[string]any) (string, bool) {
 //   - The web endpoint accepts exactly one current message, so a multi-turn
 //     conversation is flattened: earlier turns go into a JSONL history block and
 //     the final turn becomes the current message.
-func buildUpstreamPayload(req chatRequest, resolved resolvedModel, chatID string) ([]byte, error) {
+func buildUpstreamPayload(resolved resolvedModel, chatID string, ext externalizeResult) ([]byte, error) {
 	now := time.Now().Unix()
-	content := flattenMessages(req.Messages)
 	model := resolved.ID
 	chatType := resolved.ChatType
+	files := ext.files
+	if files == nil {
+		files = []any{}
+	}
 
 	body := map[string]any{
 		"stream":             true,
@@ -736,9 +748,9 @@ func buildUpstreamPayload(req chatRequest, resolved resolvedModel, chatID string
 			"parent_id":     nil,
 			"childrenIds":   []string{uuidv4()},
 			"role":          "user",
-			"content":       content,
+			"content":       ext.content,
 			"user_action":   "chat",
-			"files":         []any{},
+			"files":         files,
 			"timestamp":     now,
 			"models":        []string{model},
 			"model":         "",
@@ -791,20 +803,6 @@ func flattenMessages(msgs []chatMessage) string {
 		b.Write(append([]byte(nil), current...))
 	}
 	return b.String()
-}
-
-// previewBody renders a request body for the log, truncated and with newlines
-// escaped so one request stays on one log line. The body carries user prompts,
-// so this is intended for short-lived debugging and can be dropped by lowering
-// the log level once the path is trusted.
-func previewBody(b []byte, max int) string {
-	s := string(b)
-	if len(s) > max {
-		s = s[:max] + "...[truncated]"
-	}
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "")
-	return s
 }
 
 // --- small helpers --------------------------------------------------------

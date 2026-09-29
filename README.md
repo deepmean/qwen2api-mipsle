@@ -20,7 +20,40 @@ Implemented:
 
 Deliberately **not** ported, to keep the resident set small: the Anthropic
 compatibility layer (`/v1/messages`), the tool-calling protocol, image/video
-generation, attachment upload, and the web admin panel.
+generation, and the web admin panel.
+
+## Long-context attachments
+
+Qwen's edge (Aliyun WAF) rejects a request body at roughly 128 KiB with a
+`FAIL_SYS_USER_VALIDATE` challenge under HTTP 200. An agent client like Claude
+Code resends its whole conversation every turn (system prompt + tool schemas +
+history ≈ 950 KB), so it crosses that line within a few exchanges.
+
+Rather than dropping history, the port externalizes it exactly as upstream does:
+once the body exceeds the threshold, the conversation history is uploaded to
+Qwen as a document and referenced from `message.files`. The model reads the
+attachment, so nothing is lost.
+
+```
+POST /api/v1/files/getstsToken   -> temporary Aliyun OSS credentials + object key
+PUT  https://<bucket>.<endpoint>/<key>   (OSS Signature-V1, HMAC-SHA1)
+POST /api/v2/files/parse         -> ask Qwen to parse the document
+POST /api/v2/files/parse/status  -> poll until parsed
+```
+
+Only the parse calls are rate-limited by the WAF (counted per egress IP), so the
+uploaded history is cached per session (`attach.go`) and reused: when a later
+turn's history still starts with the lines that were baked into the cached
+document, only the new tail is sent inline and no upload happens. One parse
+covers many turns.
+
+Compaction (`context.go`) remains as the fallback for when an upload is
+unavailable, and a breaker pauses uploads for 5 minutes after the WAF repeatedly
+challenges the parse call — backing off, not retrying into the challenge.
+
+Verified on device: a 2 MB / 264-message Claude Code-shaped request is
+externalized (90 KB inline, the rest attached) and the model recalls a token
+buried at the start of the history; subsequent turns reuse the same attachment.
 
 ## What the port preserves
 
@@ -113,6 +146,8 @@ curl http://192.168.26.1:3000/v1/chat/completions \
 | `QWEN_CHAT_PROXY_URL` | `https://chat.qwen.ai` | Upstream origin |
 | `ACCOUNTS_FILE` | `/opt/qwen2api/accounts.txt` | Credentials file |
 | `MAX_CONCURRENT` | `8` | In-flight chat requests |
+| `AGENT_CONTEXT_PREFIX_TTL_SECONDS` | `1800` | How long an uploaded history attachment may be reused |
+| `AGENT_CONTEXT_PREFIX_MAX_ENTRIES` | `8` | Sessions whose attachments are cached |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` |
 
 ## Notes
@@ -125,3 +160,5 @@ curl http://192.168.26.1:3000/v1/chat/completions \
   decode `br`/`zstd`, and asking for them would produce undecodable bodies.
 - Tokens are signed in lazily and re-signed 5 minutes before expiry. A `401`/`403`
   from upstream invalidates the token so the next request re-authenticates.
+- Request bodies are never logged; only the byte size and the resolved model name,
+  so an empty reply can still be traced without recording the user's prompts.
