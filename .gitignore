@@ -16,3 +16,6 @@ qwen2api.conf
 
 # Session transcript (working notes, not part of the project)
 context_qwenproxy.txt
+
+# Temporary credential bridge used when pushing over the SOCKS5 proxy
+.git-cred-shim.sh
