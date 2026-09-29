@@ -213,9 +213,9 @@ func (c *qwenClient) signIn(ctx context.Context, acct *account) (string, int64, 
 	// The signin call only carries a UA upstream; sending the full browser
 	// profile here is harmless and keeps the egress fingerprint uniform.
 	headers := map[string]string{
-		"user-agent":     buildUserAgent(acct.fp),
-		"content-type":   "application/json",
-		"accept":         "application/json",
+		"user-agent":      buildUserAgent(acct.fp),
+		"content-type":    "application/json",
+		"accept":          "application/json",
 		"accept-language": "zh-CN,zh;q=0.9",
 	}
 

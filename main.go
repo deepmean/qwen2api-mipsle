@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -92,6 +93,48 @@ type server struct {
 	// sem bounds concurrent chat requests. The router has ~80MB free RAM and
 	// each streamed answer holds its own buffers.
 	sem chan struct{}
+
+	// modelsMu guards the catalogue cache, which is refreshed at most once per
+	// modelCacheTTL so a chat request does not pay for a discovery round trip.
+	modelsMu sync.Mutex
+	models   []modelInfo
+	modelsAt time.Time
+}
+
+// modelCacheTTL bounds how stale the catalogue may be. Upstream defaults to an
+// hour; the list changes rarely and a stale entry only costs a missed alias.
+const modelCacheTTL = time.Hour
+
+// cachedModels returns the last known catalogue, refreshing it when stale. A
+// fetch failure is not fatal: alias resolution simply falls back to the stripped
+// name, and the previous cache is kept.
+func (s *server) cachedModels() []modelInfo {
+	s.modelsMu.Lock()
+	models, at := s.models, s.modelsAt
+	s.modelsMu.Unlock()
+
+	if len(models) > 0 && time.Since(at) < modelCacheTTL {
+		return models
+	}
+	if s.pool.empty() {
+		return models
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	acct, err := s.pool.acquire(ctx)
+	if err != nil {
+		return models
+	}
+	fetched, err := s.client.listModels(ctx, acct)
+	if err != nil || len(fetched) == 0 {
+		return models
+	}
+
+	s.modelsMu.Lock()
+	s.models, s.modelsAt = fetched, time.Now()
+	s.modelsMu.Unlock()
+	return fetched
 }
 
 func (s *server) routes() http.Handler {
@@ -259,8 +302,19 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatType := "t2t"
-	chatID, err := s.client.createChatID(r.Context(), acct, model, chatType)
+	// Normalise the inbound name before anything else: clients decorate it with
+	// a `[..]` context marker and behavioural suffixes that upstream rejects.
+	resolved := resolveModel(model, s.cachedModels(), req.EnableThinking != nil && *req.EnableThinking)
+	if resolved.Unsupported != "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+			"this build does not support "+resolved.Unsupported+" (model "+model+")")
+		return
+	}
+	if resolved.ID != model {
+		log.Printf("chat: model %q -> %q (chat_type=%s thinking=%v)", model, resolved.ID, resolved.ChatType, resolved.Thinking)
+	}
+
+	chatID, err := s.client.createChatID(r.Context(), acct, resolved.ID, resolved.ChatType)
 	if err != nil {
 		var ue *upstreamError
 		if errors.As(err, &ue) && (ue.Status == 401 || ue.Status == 403) {
@@ -271,7 +325,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, err := buildUpstreamPayload(req, model, chatID, chatType)
+	payload, err := buildUpstreamPayload(req, resolved, chatID)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -301,10 +355,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if stream {
-		s.streamResponse(w, r, upstream, model)
+		s.streamResponse(w, r, upstream, resolved.ID)
 		return
 	}
-	s.bufferedResponse(w, r, upstream, model)
+	s.bufferedResponse(w, r, upstream, resolved.ID)
 }
 
 // completionID is the OpenAI-style identifier attached to every chunk of a turn.
@@ -553,17 +607,11 @@ func upstreamFailure(root map[string]any) (string, bool) {
 //   - The web endpoint accepts exactly one current message, so a multi-turn
 //     conversation is flattened: earlier turns go into a JSONL history block and
 //     the final turn becomes the current message.
-func buildUpstreamPayload(req chatRequest, model, chatID, chatType string) ([]byte, error) {
+func buildUpstreamPayload(req chatRequest, resolved resolvedModel, chatID string) ([]byte, error) {
 	now := time.Now().Unix()
 	content := flattenMessages(req.Messages)
-
-	thinking := false
-	if req.EnableThinking != nil {
-		thinking = *req.EnableThinking
-	}
-	if strings.Contains(model, "-thinking") {
-		thinking = true
-	}
+	model := resolved.ID
+	chatType := resolved.ChatType
 
 	body := map[string]any{
 		"stream":             true,
@@ -593,7 +641,7 @@ func buildUpstreamPayload(req chatRequest, model, chatID, chatType string) ([]by
 			"sub_chat_type": chatType,
 			"feature_config": map[string]any{
 				"output_schema":    "phase",
-				"thinking_enabled": thinking,
+				"thinking_enabled": resolved.Thinking,
 				"research_mode":    "normal",
 				"auto_thinking":    true,
 				"thinking_mode":    "Auto",
