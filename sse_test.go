@@ -224,3 +224,86 @@ func indexOf(h, n string) int {
 	}
 	return -1
 }
+
+// --- upstream candidate filter -------------------------------------------
+
+func created(id string, index any) map[string]any {
+	return map[string]any{"response.created": map[string]any{
+		"response_id":    id,
+		"response_index": index,
+	}}
+}
+
+func TestFilterLocksOntoPrimaryCandidate(t *testing.T) {
+	var f upstreamResponseFilter
+	// Two candidates announced; index 0 is primary.
+	if !f.accept(created("A", "0")) {
+		t.Fatal("primary announcement rejected")
+	}
+	// The backup announcement is dropped once the primary is locked.
+	if f.accept(created("B", "1")) {
+		t.Fatal("backup announcement must be dropped after the primary locks")
+	}
+	// Body frames are now locked to A.
+	if !f.accept(map[string]any{"response_id": "A"}) {
+		t.Fatal("primary body frame rejected")
+	}
+	if f.accept(map[string]any{"response_id": "B"}) {
+		t.Fatal("backup body frame must be dropped")
+	}
+}
+
+func TestFilterPrefersPrimaryEvenWhenBackupArrivesFirst(t *testing.T) {
+	var f upstreamResponseFilter
+	// Backup candidate announces first — it must NOT take the lock.
+	f.accept(created("B", "1"))
+	if f.accept(map[string]any{"response_id": "B"}) {
+		t.Fatal("backup must not be accepted before the primary is known")
+	}
+	// Primary announces later and takes the lock.
+	f.accept(created("A", "0"))
+	if !f.accept(map[string]any{"response_id": "A"}) {
+		t.Fatal("primary body frame rejected")
+	}
+}
+
+func TestFilterPassesFramesWithoutResponseID(t *testing.T) {
+	var f upstreamResponseFilter
+	if !f.accept(map[string]any{"choices": []any{}}) {
+		t.Fatal("frames without a response_id must pass")
+	}
+	// A keepalive with no id is never filtered even after a lock.
+	f.accept(created("A", "0"))
+	if !f.accept(map[string]any{"usage": map[string]any{}}) {
+		t.Fatal("id-less frame must pass after lock")
+	}
+}
+
+func TestFilterLegacyProtocolLocksFirstID(t *testing.T) {
+	var f upstreamResponseFilter
+	// No response.created at all: lock onto the first body frame with an id.
+	if !f.accept(map[string]any{"response_id": "X"}) {
+		t.Fatal("first legacy frame must be accepted")
+	}
+	if !f.accept(map[string]any{"response_id": "X"}) {
+		t.Fatal("same legacy id must keep passing")
+	}
+	if f.accept(map[string]any{"response_id": "Y"}) {
+		t.Fatal("different legacy id must be dropped")
+	}
+}
+
+func TestFilterIndexAsNumberAndCamelCase(t *testing.T) {
+	var f upstreamResponseFilter
+	// Numeric index (not a string) and camelCase id key.
+	f.accept(map[string]any{"response.created": map[string]any{
+		"responseId":    "A",
+		"responseIndex": 0,
+	}})
+	if !f.accept(map[string]any{"response_id": "A"}) {
+		t.Fatal("numeric index 0 should lock the candidate")
+	}
+	if f.accept(map[string]any{"response_id": "B"}) {
+		t.Fatal("other id must be dropped")
+	}
+}

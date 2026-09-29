@@ -520,6 +520,7 @@ var errClientGone = errors.New("client disconnected")
 type streamAccumulator struct {
 	onDelta   func(phase, content string) error
 	norm      deltaNormalizer
+	filter    upstreamResponseFilter
 	content   strings.Builder
 	reasoning strings.Builder
 	usage     upstreamUsage
@@ -610,6 +611,13 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 	if msg, ok := upstreamFailure(root); ok {
 		acc.failed = true
 		return errors.New(msg)
+	}
+
+	// Drop frames from non-primary answer candidates. Upstream runs several
+	// candidates concurrently and interleaves them; consuming them all
+	// concatenates two different answers into one garbled reply.
+	if !acc.filter.accept(root) {
+		return nil
 	}
 
 	acc.usage.merge(root["usage"])

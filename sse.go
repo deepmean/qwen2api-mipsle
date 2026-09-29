@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -134,6 +135,103 @@ func parseSSEFrame(raw string) (sseFrame, bool) {
 func isJSON(s string) bool {
 	var v any
 	return json.Unmarshal([]byte(s), &v) == nil
+}
+
+// --- upstream candidate filter --------------------------------------------
+
+// upstreamResponseFilter drops frames belonging to non-primary answer candidates.
+//
+// Qwen answers an agent request by running several candidates concurrently and
+// interleaving their frames on one stream. Every candidate carries the same
+// `choices[0].delta`, so consuming all of them concatenates two different answers
+// into one garbled reply. The web client defines `response_index: 0` as the
+// primary answer and ignores the rest; this mirrors that.
+//
+// Ported from Qwen2API src/utils/sse.js#createUpstreamResponseFilter.
+//
+// The lock cannot be taken by "whoever emits a delta first": a backup candidate
+// can beat the primary one, and then the wrong response_id is adopted as the
+// conversation's parent. Instead the filter waits for the `response.created`
+// announcement and locks onto index 0, falling back to the first announced id
+// when the index is missing, and to the first frame that carries a response_id
+// on the legacy protocol that has no announcement at all.
+type upstreamResponseFilter struct {
+	acceptedID     string
+	sawCreated     bool
+	responseIndexs map[string]int
+}
+
+func newUpstreamResponseFilter() *upstreamResponseFilter {
+	return &upstreamResponseFilter{responseIndexs: map[string]int{}}
+}
+
+// accept reports whether the frame belongs to the primary candidate.
+func (f *upstreamResponseFilter) accept(root map[string]any) bool {
+	if created, ok := root["response.created"].(map[string]any); ok {
+		f.sawCreated = true
+		id, _ := stringField(created, "response_id")
+		if id == "" {
+			id, _ = stringField(created, "responseId")
+		}
+		idx, hasIdx := numberFieldAny(created, "response_index", "responseIndex")
+		if id != "" && hasIdx {
+			if f.responseIndexs == nil {
+				f.responseIndexs = map[string]int{}
+			}
+			f.responseIndexs[id] = idx
+		}
+		if id != "" && hasIdx && idx == 0 {
+			f.acceptedID = id
+		} else if id != "" && f.acceptedID == "" && !hasIdx {
+			f.acceptedID = id
+		}
+		// No id at all, or nothing accepted yet, lets the frame through so an
+		// announcement never blocks the stream.
+		return id == "" || f.acceptedID == "" || id == f.acceptedID
+	}
+
+	id, _ := stringField(root, "response_id")
+	if id == "" {
+		return true
+	}
+	if f.acceptedID != "" {
+		return id == f.acceptedID
+	}
+	if idx, ok := f.responseIndexs[id]; ok {
+		if idx == 0 {
+			f.acceptedID = id
+			return true
+		}
+		return false
+	}
+	if f.sawCreated {
+		return false
+	}
+	// Legacy protocol: no announcement, so lock onto the first body frame that
+	// carries an id.
+	f.acceptedID = id
+	return true
+}
+
+// numberFieldAny reads the first present key, which upstream sends as a number
+// or a string.
+func numberFieldAny(m map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		if v, ok := m[key]; ok {
+			switch n := v.(type) {
+			case float64:
+				return int(n), true
+			case int:
+				return n, true
+			case string:
+				var parsed int
+				if _, err := fmt.Sscanf(n, "%d", &parsed); err == nil {
+					return parsed, true
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 // --- upstream delta normalisation ----------------------------------------
