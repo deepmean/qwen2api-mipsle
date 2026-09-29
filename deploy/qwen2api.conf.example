@@ -1,0 +1,14 @@
+# qwen2api operator settings, sourced by /etc/init.d/qwen2api.
+#
+#   chmod 600 /opt/qwen2api/qwen2api.conf
+#
+# First key is the admin key upstream; this build treats every key as equivalent
+# because the admin panel is not part of the port.
+API_KEY=sk-change-me
+
+# TCP port to serve on. 3000 is upstream's default and is free on this router
+# (8080 is taken by mimo-proxy, 8788 by wb-proxy).
+SERVICE_PORT=3000
+
+# DEBUG | INFO | WARN | ERROR
+LOG_LEVEL=INFO

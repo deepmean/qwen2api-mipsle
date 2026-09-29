@@ -1,0 +1,18 @@
+# Qwen account credentials, one per line:
+#
+#     email:password
+#
+# Blank lines and lines starting with '#' are ignored. The password may contain
+# ':' — only the first colon separates the two fields.
+#
+#   chmod 600 /opt/qwen2api/accounts.txt
+#
+# The file is read once at startup. After editing it, restart the service:
+#
+#     /etc/init.d/qwen2api restart
+#
+# Accounts are used round-robin. Each account's browser identity (device id,
+# screen, locale, WebGL renderer) is derived from its email, so the same account
+# always presents the same fingerprint to Qwen.
+#
+# example@example.com:your-password

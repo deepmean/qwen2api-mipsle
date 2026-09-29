@@ -1,0 +1,32 @@
+# License and attribution
+
+## This port
+
+The Go sources in this repository are a reimplementation of the core chat path
+of [deepmean/Qwen2API](https://github.com/deepmean/Qwen2API), which is itself a
+fork of [Rfym21/Qwen2API](https://github.com/Rfym21/Qwen2API). The upstream
+project declares `"license": "ISC"` in its `package.json`, though it ships no
+`LICENSE` file.
+
+`src/utils/cookie-generator.js` and `src/utils/fingerprint.js` upstream were
+translated to Go in `ssxmod.go`. `src/utils/header-profile.js`,
+`src/utils/token-manager.js`, `src/utils/sse.js`,
+`src/utils/chat-helpers.js` and `src/middlewares/chat-middleware.js` informed
+`qwen.go`, `sse.go` and `main.go`. No upstream file is copied verbatim.
+
+Because the upstream project is ISC-licensed, this port is distributed under the
+same terms:
+
+## ISC License
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.

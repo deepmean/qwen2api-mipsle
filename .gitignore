@@ -1,0 +1,14 @@
+# Build output
+dist/
+
+# Reference copies of upstream sources, fetched only to cross-validate the
+# cookie encoder. Not part of this project.
+ref/
+
+# Local credentials — never commit
+accounts.txt
+qwen2api.conf
+
+# Go
+*.test
+*.out
