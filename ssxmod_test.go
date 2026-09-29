@@ -5,7 +5,7 @@ import "testing"
 // Reference values produced by running the upstream JavaScript directly
 // (ref/fingerprint.js + ref/cookie-generator.js) under Node.
 const (
-	refEmail      = "test@example.com"
+	refEmail       = "test@example.com"
 	refFingerprint = "973dfe463ec85785f5f9^websdk-2.3.15d^1765348410850^91^1|15^zh-TW^-480^16705151|12791^1920|1080|283|1080|158|0|1920|1080|1920|922|0|0^5^Win32^10^ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)|Google Inc. (NVIDIA)^30|30^0^28^5|956755675^764615716^3868730536^1^0^1^0^P^0^0^0^416^Google Inc.^8^-1|0|0|0|0^2661703098^11^1765348410850^1317092247^0^69"
 
 	refEncHello = "GK3qjO0kGH01oitqGjPGt47tLD"

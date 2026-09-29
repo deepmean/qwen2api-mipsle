@@ -12,6 +12,7 @@ package main
 // admin panel — is deliberately out of scope to keep the resident set small.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -267,8 +268,25 @@ func (m chatMessage) text() string {
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
+	// Log every inbound turn at entry. Without this, a request that never
+	// reaches the upstream is indistinguishable from one that was never sent,
+	// which is exactly the ambiguity that makes "empty reply" reports hard to
+	// diagnose.
+	//
+	// Read the body once so it can be logged before decoding: seeing exactly
+	// what the client sent is the difference between guessing and diagnosing.
+	rawBody, err := readAllLimited(r.Body, 4<<20)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "could not read body: "+err.Error())
+		return
+	}
+	log.Printf("chat: <- %s %s (%d bytes) ua=%q", r.Method, r.URL.Path, len(rawBody), r.Header.Get("user-agent"))
+	if len(rawBody) > 0 {
+		log.Printf("chat: body %s", previewBody(rawBody, 2000))
+	}
+
 	var req chatRequest
-	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
 	if err := dec.Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
 		return
@@ -302,6 +320,18 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keep the body under the WAF's ~128 KiB ceiling. Agent clients resend their
+	// whole conversation each turn, so without this every turn past the limit is
+	// answered with a challenge (HTTP 200, no text).
+	if size := len(flattenMessages(req.Messages)); size > defaultUpstreamBudgetBytes {
+		compacted, dropped := compactMessages(req.Messages, defaultUpstreamBudgetBytes)
+		if dropped > 0 {
+			log.Printf("chat: compacted context %d -> %d messages (%d bytes -> %d bytes)",
+				len(req.Messages), len(compacted), size, len(flattenMessages(compacted)))
+			req.Messages = compacted
+		}
+	}
+
 	// Normalise the inbound name before anything else: clients decorate it with
 	// a `[..]` context marker and behavioural suffixes that upstream rejects.
 	resolved := resolveModel(model, s.cachedModels(), req.EnableThinking != nil && *req.EnableThinking)
@@ -313,6 +343,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if resolved.ID != model {
 		log.Printf("chat: model %q -> %q (chat_type=%s thinking=%v)", model, resolved.ID, resolved.ChatType, resolved.Thinking)
 	}
+	// Always report what was resolved, so a silent upstream (200 + empty stream)
+	// can be traced back to the exact name that was sent.
+	log.Printf("chat: model=%q resolved=%q chat_type=%s thinking=%v msgs=%d stream=%v",
+		model, resolved.ID, resolved.ChatType, resolved.Thinking, len(req.Messages), stream)
 
 	chatID, err := s.client.createChatID(r.Context(), acct, resolved.ID, resolved.ChatType)
 	if err != nil {
@@ -387,6 +421,7 @@ func (s *server) bufferedResponse(w http.ResponseWriter, r *http.Request, upstre
 
 // streamResponse relays the answer as OpenAI SSE chunks.
 func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, upstream *response, model string) {
+	streamStart := time.Now()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.bufferedResponse(w, r, upstream, model)
@@ -444,6 +479,11 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, upstream
 		// complete is worse than an explicit error.
 		writeJSONError(w, 0, "server_error", err.Error())
 	}
+	log.Printf("chat: -> %d bytes content, %d bytes reasoning, frames=%d/%d raw, err=%v, %s",
+		acc.content.Len(), acc.reasoning.Len(), acc.frames, acc.raw, err, time.Since(streamStart).Round(time.Millisecond))
+	for i, s := range acc.rawSamples {
+		log.Printf("chat:   unusable frame[%d] %s", i, s)
+	}
 
 	finish := "stop"
 	if err != nil && !errors.Is(err, errClientGone) {
@@ -474,11 +514,33 @@ type streamAccumulator struct {
 	content   strings.Builder
 	reasoning strings.Builder
 	usage     upstreamUsage
-	failed    bool
-	wrote     bool
+	// frames counts upstream SSE frames that carried a choice, and raw counts
+	// every frame seen — the pair distinguishes "upstream sent nothing" from
+	// "upstream sent frames this build does not recognise".
+	frames int
+	raw    int
+	// rawSamples keeps the first few frames that produced no delta, so an empty
+	// answer can be explained instead of guessed at.
+	rawSamples []string
+	failed     bool
+	wrote      bool
 }
 
 func newStreamAccumulator() *streamAccumulator { return &streamAccumulator{} }
+
+// sample records an unrecognised frame for the end-of-turn log, keeping only the
+// first few so a chatty upstream cannot grow the buffer without limit.
+func (a *streamAccumulator) sample(s string) {
+	const maxSamples = 3
+	const maxLen = 500
+	if len(a.rawSamples) >= maxSamples {
+		return
+	}
+	if len(s) > maxLen {
+		s = s[:maxLen] + "..."
+	}
+	a.rawSamples = append(a.rawSamples, s)
+}
 
 func (a *streamAccumulator) wroteAnything() bool { return a.wrote }
 
@@ -521,13 +583,16 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 	if data == "" || data == "[DONE]" {
 		return nil
 	}
+	acc.raw++
 	if !strings.HasPrefix(data, "{") {
+		acc.sample(data)
 		return nil
 	}
 
 	var root map[string]any
 	if err := json.Unmarshal([]byte(data), &root); err != nil {
 		// A partial or non-JSON frame is not fatal on its own; skip it.
+		acc.sample(data)
 		return nil
 	}
 
@@ -542,8 +607,12 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 
 	choices, _ := root["choices"].([]any)
 	if len(choices) == 0 {
+		// A frame with no choices is either a keepalive or the shape upstream
+		// uses to report a refused request; record it so the two are separable.
+		acc.sample(data)
 		return nil
 	}
+	acc.frames++
 	choice, _ := choices[0].(map[string]any)
 	if choice == nil {
 		return nil
@@ -555,6 +624,9 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 
 	phase, content, ok := acc.norm.normalize(delta)
 	if !ok {
+		if b, err := json.Marshal(delta); err == nil {
+			acc.sample(string(b))
+		}
 		return nil
 	}
 
@@ -572,7 +644,20 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 
 // upstreamFailure recognises the error envelopes Qwen returns inside a 200
 // stream. The shapes vary, so several key spellings are checked.
+//
+// The most important one is the WAF challenge. Qwen's edge answers an oversized
+// or suspicious request with HTTP 200 and a body like:
+//
+//	{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."],
+//	 "data":{"url":"https://chat.qwen.ai/.../_____tmd_____/punish?x5secdata=..."}}
+//
+// Left unrecognised it looks like a stream that simply produced no text, so the
+// caller returns a successful but empty answer. Detecting it turns a silent
+// failure into an explicit one.
 func upstreamFailure(root map[string]any) (string, bool) {
+	if msg, ok := wafChallenge(root); ok {
+		return msg, true
+	}
 	if errObj, ok := root["error"].(map[string]any); ok {
 		if msg, ok := errObj["message"].(string); ok && msg != "" {
 			return msg, true
@@ -595,6 +680,26 @@ func upstreamFailure(root map[string]any) (string, bool) {
 		return "upstream status failed", true
 	}
 	return "", false
+}
+
+// wafChallenge detects the Aliyun WAF "user validate" envelope. The `ret` field
+// is an array whose first element names the verdict.
+func wafChallenge(root map[string]any) (string, bool) {
+	ret, ok := root["ret"].([]any)
+	if !ok || len(ret) == 0 {
+		return "", false
+	}
+	code, _ := ret[0].(string)
+	if !strings.HasPrefix(code, "FAIL_SYS_USER_VALIDATE") && !strings.HasPrefix(code, "FAIL_SYS_") {
+		return "", false
+	}
+	detail := code
+	if len(ret) > 1 {
+		if d, ok := ret[1].(string); ok && d != "" {
+			detail = d
+		}
+	}
+	return "upstream WAF challenge: " + detail, true
 }
 
 // --- upstream request body ------------------------------------------------
@@ -686,6 +791,20 @@ func flattenMessages(msgs []chatMessage) string {
 		b.Write(append([]byte(nil), current...))
 	}
 	return b.String()
+}
+
+// previewBody renders a request body for the log, truncated and with newlines
+// escaped so one request stays on one log line. The body carries user prompts,
+// so this is intended for short-lived debugging and can be dropped by lowering
+// the log level once the path is trusted.
+func previewBody(b []byte, max int) string {
+	s := string(b)
+	if len(s) > max {
+		s = s[:max] + "...[truncated]"
+	}
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
 }
 
 // --- small helpers --------------------------------------------------------
