@@ -34,8 +34,8 @@ import (
 const maxUploadBytes = 100 * 1024 * 1024
 
 // stsResponse is the getstsToken reply. The endpoint wraps it as {success,data}
-// in FE 0.2.81 and returns the fields directly in older builds, so both shapes
-// are accepted.
+// in current FE builds (0.3.12) and returns the fields directly in older builds,
+// so both shapes are accepted.
 type stsResponse struct {
 	Success         *bool        `json:"success"`
 	AccessKeyID     string       `json:"access_key_id"`
@@ -280,7 +280,7 @@ func looksLikeWAFPage(body []byte) bool {
 }
 
 // buildChatFileDescriptor builds the message.files entry that references a
-// parsed document, matching Qwen Web 0.2.81 (upload.js#buildChatFileDescriptor).
+// parsed document, matching Qwen Web 0.3.12 (upload.js#buildChatFileDescriptor).
 func buildChatFileDescriptor(fileID, fileURL, filename string, size int) map[string]any {
 	now := time.Now().UnixMilli()
 	return map[string]any{

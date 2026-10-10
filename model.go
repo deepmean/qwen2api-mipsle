@@ -60,11 +60,17 @@ func splitModelSuffix(model string) (base, suffix string) {
 }
 
 // chatTypeForSuffix maps a behavioural suffix onto the upstream chat_type.
-// Only the text-producing types are supported by this port.
+//
+// `-image` selects t2i (text-to-image). The upstream answers it on the ordinary
+// completions stream: the generated picture arrives as a URL in
+// `choices[0].delta.content` with `phase: "image_gen"`, so it needs no separate
+// transport — see the note on deltaNormalizer.
 func chatTypeForSuffix(suffix string) string {
 	switch suffix {
 	case "-search", "-thinking-search":
 		return "search"
+	case "-image":
+		return "t2i"
 	default:
 		return "t2t"
 	}
@@ -72,11 +78,16 @@ func chatTypeForSuffix(suffix string) string {
 
 // unsupportedChatType reports whether a suffix selects a modality this port does
 // not implement, so the caller can fail loudly instead of silently answering
-// with text for an image or video request.
+// with text for a request it cannot serve.
+//
+// -image-edit needs the caller's input picture carried in message.files, which
+// this build does not parse (chatMessage.text drops non-text parts), so it would
+// silently edit nothing. -video needs task polling over a multi-minute window,
+// which is a different lifecycle. Both stay rejected on purpose.
 func unsupportedChatType(suffix string) (string, bool) {
 	switch suffix {
-	case "-image", "-image-edit":
-		return "image generation", true
+	case "-image-edit":
+		return "image editing", true
 	case "-video":
 		return "video generation", true
 	case "-deep-research":

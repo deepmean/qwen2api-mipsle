@@ -237,9 +237,22 @@ func numberFieldAny(m map[string]any, keys ...string) (int, bool) {
 // --- upstream delta normalisation ----------------------------------------
 
 // answerPhases mirrors ANSWER_PHASES in tool-prompt.js.
+//
+// imagePhase is included deliberately: a generated picture arrives as a URL on
+// the ordinary `content` field tagged `phase: "image_gen"`. Without this entry
+// the frame still survives on the `hasC` branch below, but classifying it as an
+// answer keeps `reasoning_content` from being preferred if a frame ever carries
+// both, and stops the phase from being treated as an unknown one.
 var answerPhases = map[string]bool{
 	"answer": true, "final": true, "final_answer": true, "response": true,
+	imagePhase: true,
 }
+
+// imagePhase is the phase upstream tags a generated picture with. The URL itself
+// arrives on the ordinary `content` field, so an image answer needs no separate
+// transport. A frame carrying phase "image_gen" with no content is the terminal
+// "finished" tick and yields nothing, which is correct.
+const imagePhase = "image_gen"
 
 func isThinkPhase(phase string) bool {
 	return phase == "think" || phase == "thinking" || phase == "thinking_summary"

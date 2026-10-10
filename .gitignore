@@ -14,8 +14,15 @@ qwen2api.conf
 *.out
 *.exe
 
+# Locally unpacked Go toolchain (windows-arm64), used to cross-build the mipsle
+# binary. Not part of the project.
+.toolchain/
+
 # Session transcript (working notes, not part of the project)
 context_qwenproxy.txt
+
+# Scratch output from the image-generation workbench (not part of the project)
+dsh-image-gen/
 
 # Temporary credential bridge used when pushing over the SOCKS5 proxy
 .git-cred-shim.sh

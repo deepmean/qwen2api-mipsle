@@ -1,0 +1,132 @@
+name: build
+
+# Cloud build for the MIPS32 target (ramips/mt7621, OpenWrt).
+#
+# The release binary is produced here rather than on a workstation so the
+# toolchain and the build flags are reproducible and identical for every build.
+# To ship a new binary: push to main (rolling `latest` prerelease) or tag a
+# commit `v*` (a normal release).
+#
+# GOMIPS=softfloat is mandatory — MT7621 has no usable FPU and a hard-float
+# build crashes on the device. The verify job asserts it at the ELF level before
+# anything is uploaded, so a bad binary can never reach a release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # The module has no dependencies, so there is no module cache to keep.
+          cache: false
+
+      - name: go vet
+        run: go vet ./...
+
+      # Includes the ssxmod cookie encoder, which is cross-checked byte-for-byte
+      # against the upstream JavaScript and is the part most likely to break
+      # silently when the fingerprint template drifts.
+      - name: go test
+        run: go test ./...
+
+  build:
+    name: cross-compile mipsle
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: mipsle
+          GOMIPS: softfloat
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/qwen2api-linux-mipsle .
+
+      # Fail here rather than ship a binary that dies on the router. Each
+      # assertion below corresponds to a real failure mode:
+      #   - wrong machine / endianness: the kernel refuses to exec it
+      #   - hard float: exec succeeds, then it crashes on first FP use
+      #   - dynamic: the router image has no matching interpreter
+      - name: Verify the binary
+        run: |
+          set -eu
+          bin=dist/qwen2api-linux-mipsle
+          file "$bin"
+
+          hdr=$(readelf -h "$bin")
+          echo "$hdr"
+          echo '--- MIPS ABI flags ---'
+          abi=$(readelf -A "$bin")
+          echo "$abi"
+
+          echo '--- assertions ---'
+          echo "$hdr" | grep -q 'Class:.*ELF32'        || { echo 'FAIL: not ELF32'; exit 1; }
+          echo "$hdr" | grep -q 'little endian'        || { echo 'FAIL: not little endian'; exit 1; }
+          echo "$hdr" | grep -q 'Machine:.*MIPS'       || { echo 'FAIL: not MIPS'; exit 1; }
+
+          # binutils prints "FP ABI: Soft float" for fp_abi=3, which is what the
+          # Go linker writes when GOMIPS=softfloat.
+          echo "$abi" | grep -qi 'soft float'          || { echo 'FAIL: not soft-float; would crash on MT7621'; exit 1; }
+
+          # Static: no interpreter and no dynamic section.
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo 'FAIL: dynamically linked (has an interpreter)'; exit 1
+          fi
+
+          echo 'all checks passed'
+          ls -l "$bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen2api-linux-mipsle-${{ github.sha }}
+          path: dist/qwen2api-linux-mipsle
+          if-no-files-found: error
+
+      # A rolling prerelease so a stable download URL always exists — fetch it
+      # straight onto a router with wget.
+      - name: Publish rolling latest
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build (main)
+          prerelease: true
+          files: dist/qwen2api-linux-mipsle
+          body: |
+            Automatic build of `${{ github.sha }}`.
+
+            ```sh
+            wget -O /tmp/qwen2api.new \
+              https://github.com/deepmean/qwen2api-mipsle/releases/download/latest/qwen2api-linux-mipsle
+            chmod +x /tmp/qwen2api.new
+            ```
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/qwen2api-linux-mipsle
+          generate_release_notes: true

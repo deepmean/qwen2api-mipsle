@@ -30,7 +30,17 @@ import (
 // chromeVersions mirrors header-profile.js CHROME_VERSIONS.
 var chromeVersions = []string{"149.0.0.0", "148.0.0.0", "147.0.0.0", "146.0.0.0"}
 
-// frontendVersion is the `version` header the web client sends (FE 0.2.81).
+// frontendVersion is the `version` header sent with every upstream call.
+//
+// The live qwen-chat-fe build moved on (0.2.81 -> 0.3.12 as of the 2026-10
+// refresh; the build is in the asset URLs on https://chat.qwen.ai/), but the
+// API does NOT accept a bare version bump from this client: sending
+// `version: 0.3.12` makes /api/v2/chats/new answer
+// `{"success":false,"data":{"code":"Unauthorized"}}`, while 0.2.81 is accepted.
+// The web client can send 0.3.12 because its ssxmod fingerprint template moves
+// with it; ours is pinned to the 0.2.81 profile, and a version that disagrees
+// with the fingerprint is rejected. Keep this in lockstep with the ssxmod
+// template in ssxmod.go, not with the live FE build.
 const frontendVersion = "0.2.81"
 
 // defaultChatBase is upstream's origin, used when the configuration did not
@@ -245,7 +255,7 @@ func (c *qwenClient) signIn(ctx context.Context, acct *account) (string, int64, 
 	return parsed.Token, jwtExpiry(parsed.Token), nil
 }
 
-// jwtExpiry reads the `exp` claim without verifying the signature — the token
+// jwtExpiry reads the `exp` claim without verifying the signature 鈥?the token
 // comes from Qwen over TLS, so this is a freshness check, not an auth check.
 func jwtExpiry(token string) int64 {
 	parts := strings.Split(token, ".")
@@ -302,10 +312,10 @@ func (c *qwenClient) createChatID(ctx context.Context, acct *account, model, cha
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("chats/new: bad json: %w", err)
+		return "", fmt.Errorf("chats/new: bad json (%s): %w", truncateForLog(string(body), 300), err)
 	}
 	if parsed.Data.ID == "" {
-		return "", fmt.Errorf("chats/new: response carried no chat id")
+		return "", fmt.Errorf("chats/new: response carried no chat id: %s", truncateForLog(string(body), 300))
 	}
 	return parsed.Data.ID, nil
 }

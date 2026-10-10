@@ -71,6 +71,22 @@ func TestBuildHeadersCarriesRequiredProfile(t *testing.T) {
 	}
 }
 
+func TestBuildHeadersSendsAcceptedFrontendVersion(t *testing.T) {
+	acct := &account{Email: "user@example.com", fp: generateDeterministicFingerprint("user@example.com")}
+	h := buildHeaders(acct, "jwt", "application/json", "/")
+	if h["version"] != frontendVersion {
+		t.Fatalf("version header = %q, want %q", h["version"], frontendVersion)
+	}
+	// The pin is deliberate and must not track the live FE build: sending
+	// 0.3.12 (the current build) gets /api/v2/chats/new answered
+	// `{"success":false,"data":{"code":"Unauthorized"}}`, because our ssxmod
+	// fingerprint template is the 0.2.81 profile and the two must agree.
+	// Bumping this requires moving the fingerprint template in ssxmod.go too.
+	if frontendVersion != "0.2.81" {
+		t.Fatalf("frontendVersion = %q; bumping it without the matching ssxmod template gets Unauthorized", frontendVersion)
+	}
+}
+
 func TestPickChromeVersionIsStable(t *testing.T) {
 	fp := generateDeterministicFingerprint("stable@example.com")
 	first := pickChromeVersion(fp)
@@ -135,5 +151,24 @@ func TestUpstreamFailureShapes(t *testing.T) {
 		if _, ok := upstreamFailure(root); ok != tc.want {
 			t.Errorf("upstreamFailure(%s) = %v, want %v", tc.body, ok, tc.want)
 		}
+	}
+}
+
+// The model catalogue advertises a -image variant only for models whose upstream
+// metadata declares the t2i capability, so a client can discover it.
+func TestHasChatType(t *testing.T) {
+	types := []string{"t2t", "t2v", "t2i", "image_edit", "search"}
+	if !hasChatType(types, "t2i") {
+		t.Fatal("t2i should be detected")
+	}
+	if hasChatType(types, "t2i-other") {
+		t.Fatal("a different capability must not match")
+	}
+	if hasChatType(nil, "t2i") {
+		t.Fatal("nil capability list must not match")
+	}
+	// Upstream has been observed padding values with whitespace.
+	if !hasChatType([]string{" t2i "}, "t2i") {
+		t.Fatal("whitespace-padded capability should match")
 	}
 }

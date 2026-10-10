@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,10 +66,11 @@ func main() {
 	}
 
 	srv := &server{
-		pool:   p,
-		client: client,
-		sem:    make(chan struct{}, currentConfig.MaxConcurrent),
-		prefix: newPrefixCache(time.Duration(currentConfig.PrefixCacheTTLSec)*time.Second, currentConfig.PrefixCacheMaxEntries),
+		pool:     p,
+		client:   client,
+		sem:      make(chan struct{}, currentConfig.MaxConcurrent),
+		imageSem: make(chan struct{}, currentConfig.ImageMaxConcurrent),
+		prefix:   newPrefixCache(time.Duration(currentConfig.PrefixCacheTTLSec)*time.Second, currentConfig.PrefixCacheMaxEntries),
 	}
 
 	httpSrv := &http.Server{
@@ -80,7 +82,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("qwen2api listening on :%d (max_concurrent=%d)", currentConfig.ListenPort, currentConfig.MaxConcurrent)
+		log.Printf("qwen2api listening on :%d (max_concurrent=%d image_max_concurrent=%d)",
+			currentConfig.ListenPort, currentConfig.MaxConcurrent, currentConfig.ImageMaxConcurrent)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
@@ -103,6 +106,13 @@ type server struct {
 	// sem bounds concurrent chat requests. The router has ~80MB free RAM and
 	// each streamed answer holds its own buffers.
 	sem chan struct{}
+
+	// imageSem bounds image-generation requests separately. A t2i answer is just
+	// a URL on the ordinary stream, so it is cheap; the cost is the b64_json
+	// download, which pulls the PNG into RAM and base64-expands it. Kept at 2 by
+	// default because the measured OOM point on this device was 4 concurrent
+	// multi-megabyte buffers.
+	imageSem chan struct{}
 
 	// prefix caches uploaded history attachments so a parse covers many turns.
 	prefix *prefixCache
@@ -158,6 +168,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/v1/models", s.withAuth(s.handleModels))
 	mux.HandleFunc("/models", s.handleModels) // mirrors upstream's unauthenticated alias
 	mux.HandleFunc("/v1/chat/completions", s.withAuth(s.handleChat))
+	mux.HandleFunc("/v1/images/generations", s.withAuth(s.handleImageGeneration))
 	return mux
 }
 
@@ -228,8 +239,21 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data := make([]map[string]any, 0, len(models))
+	// Upstream lists only bare ids, so a client asking for `qwen3.8-max-image`
+	// never sees it advertised. The suffix is how this gateway and the upstream
+	// web client both express "use the image capability of this model", so the
+	// variants are synthesised here from the model's declared chat_types — the
+	// same capability check the upstream metadata carries.
+	expanded := make([]modelInfo, 0, len(models)*2)
 	for _, m := range models {
+		expanded = append(expanded, m)
+		if hasChatType(m.ChatTypes, "t2i") {
+			expanded = append(expanded, modelInfo{ID: m.ID + "-image", Name: m.Name + "-image", ChatTypes: m.ChatTypes})
+		}
+	}
+
+	data := make([]map[string]any, 0, len(expanded))
+	for _, m := range expanded {
 		data = append(data, map[string]any{
 			"id":       m.ID,
 			"object":   "model",
@@ -238,6 +262,16 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// hasChatType reports whether the upstream metadata advertises a capability.
+func hasChatType(types []string, want string) bool {
+	for _, t := range types {
+		if strings.EqualFold(strings.TrimSpace(t), want) {
+			return true
+		}
+	}
+	return false
 }
 
 // chatRequest is the accepted inbound OpenAI body. Unknown fields are ignored.
@@ -251,6 +285,9 @@ type chatRequest struct {
 	// EnableThinking / ThinkingBudget are Qwen extensions upstream supports.
 	EnableThinking *bool `json:"enable_thinking"`
 	ThinkingBudget int   `json:"thinking_budget"`
+	// Size selects the output aspect ratio for image requests ("1:1", "16:9",
+	// ...). Ignored on the text path.
+	Size string `json:"size"`
 }
 
 type chatMessage struct {
@@ -320,7 +357,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	stream := req.Stream != nil && *req.Stream
 
-	// Acquire a concurrency slot before doing any upstream work.
+	// Acquire a concurrency slot before doing any upstream work. Image requests
+	// take their own, tighter gate as well: the generated picture is a URL on the
+	// stream (cheap), but a b64_json caller makes us download and expand it, and
+	// that is the allocation this device cannot do many times at once.
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
@@ -328,13 +368,6 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", "too many concurrent requests")
-		return
-	}
-
-	acct, err := s.pool.acquire(r.Context())
-	if err != nil {
-		status := http.StatusServiceUnavailable
-		writeJSONError(w, status, "server_error", err.Error())
 		return
 	}
 
@@ -346,6 +379,27 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"this build does not support "+resolved.Unsupported+" (model "+model+")")
 		return
 	}
+
+	if resolved.ChatType == "t2i" {
+		select {
+		case s.imageSem <- struct{}{}:
+			defer func() { <-s.imageSem }()
+		case <-r.Context().Done():
+			return
+		default:
+			writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error",
+				"too many concurrent image requests")
+			return
+		}
+	}
+
+	acct, err := s.pool.acquire(r.Context())
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		writeJSONError(w, status, "server_error", err.Error())
+		return
+	}
+
 	if resolved.ID != model {
 		log.Printf("chat: model %q -> %q (chat_type=%s thinking=%v)", model, resolved.ID, resolved.ChatType, resolved.Thinking)
 	}
@@ -359,7 +413,15 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// answered with a challenge (HTTP 200, no text). Prefer moving the history
 	// into a document attachment (lossless); fall back to compaction only when
 	// uploads are unavailable.
-	ext := s.externalizeContext(r.Context(), acct, req.Messages, resolved.ID)
+	//
+	// An image request is a single prompt, not a conversation, and attaching a
+	// document to it would confuse the t2i controller — so it goes inline.
+	var ext externalizeResult
+	if resolved.ChatType == "t2i" {
+		ext = externalizeResult{content: flattenMessages(req.Messages), mode: "inline"}
+	} else {
+		ext = s.externalizeContext(r.Context(), acct, req.Messages, resolved.ID)
+	}
 
 	chatID, err := s.client.createChatID(r.Context(), acct, resolved.ID, resolved.ChatType)
 	if err != nil {
@@ -372,7 +434,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, err := buildUpstreamPayload(resolved, chatID, ext)
+	payload, err := buildUpstreamPayloadSized(resolved, chatID, ext, normalizeImageSize(req.Size))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -424,12 +486,23 @@ func (s *server) bufferedResponse(w http.ResponseWriter, r *http.Request, upstre
 		}
 	}
 
+	// A t2i answer has no prose: the payload is the picture URL. Emit it as the
+	// message body so a caller that asked for an image through the chat endpoint
+	// receives the link instead of an empty string.
+	content := acc.content.String()
+	if imgs := acc.images; len(imgs) > 0 {
+		if content != "" {
+			content += "\n"
+		}
+		content += strings.Join(imgs, "\n")
+	}
+
 	finish := "stop"
 	if acc.failed {
 		finish = "stop"
 	}
 	writeJSON(w, http.StatusOK, json.RawMessage(
-		responseJSON(completionID(), model, time.Now().Unix(), acc.content.String(), acc.reasoning.String(), finish, acc.usage)))
+		responseJSON(completionID(), model, time.Now().Unix(), content, acc.reasoning.String(), finish, acc.usage)))
 }
 
 // streamResponse relays the answer as OpenAI SSE chunks.
@@ -484,6 +557,15 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, upstream
 		}
 		return nil
 	}
+	// An image answer is a URL, not prose. It is captured separately by the
+	// accumulator, so relay it here as content: a streaming client that asked for
+	// an image must not see an empty stream.
+	acc.onImage = func(url string) error {
+		if !write(chunkJSON(id, model, created, &openAIDelta{Content: url}, nil)) {
+			return errClientGone
+		}
+		return nil
+	}
 
 	err := consumeUpstream(r.Context(), upstream.Body, acc)
 	if err != nil && !errors.Is(err, errClientGone) {
@@ -528,6 +610,13 @@ type streamAccumulator struct {
 	content   strings.Builder
 	reasoning strings.Builder
 	usage     upstreamUsage
+	// images collects generated picture URLs. Upstream tags these frames with
+	// phase "image_gen" and puts the URL on the ordinary content field, so they
+	// are separated here from the text answer rather than mixed into it.
+	images []string
+	// onImage relays a captured picture URL to a streaming client. It is separate
+	// from onDelta because an image is not prose.
+	onImage func(url string) error
 	// frames counts upstream SSE frames that carried a choice, and raw counts
 	// every frame seen — the pair distinguishes "upstream sent nothing" from
 	// "upstream sent frames this build does not recognise".
@@ -655,6 +744,17 @@ func handleFrame(frame sseFrame, acc *streamAccumulator) error {
 	}
 
 	acc.wrote = true
+	// A generated picture arrives as a URL on `content` under phase "image_gen".
+	// Keep it out of the text answer so a client reading `content` does not get a
+	// bare URL where prose is expected, and so the image endpoint can find it.
+	if p, _ := delta["phase"].(string); p == imagePhase {
+		url := strings.TrimSpace(content)
+		acc.images = append(acc.images, url)
+		if acc.onImage != nil && url != "" {
+			return acc.onImage(url)
+		}
+		return nil
+	}
 	if phase == "think" {
 		acc.reasoning.WriteString(content)
 	} else {
@@ -737,12 +837,63 @@ func wafChallenge(root map[string]any) (string, bool) {
 //     conversation is flattened: earlier turns go into a JSONL history block and
 //     the final turn becomes the current message.
 func buildUpstreamPayload(resolved resolvedModel, chatID string, ext externalizeResult) ([]byte, error) {
+	return buildUpstreamPayloadSized(resolved, chatID, ext, "")
+}
+
+// buildUpstreamPayloadSized is buildUpstreamPayload plus an optional asset size
+// ("1:1", "16:9", ...). Size is only meaningful for the image chat types.
+func buildUpstreamPayloadSized(resolved resolvedModel, chatID string, ext externalizeResult, size string) ([]byte, error) {
 	now := time.Now().Unix()
 	model := resolved.ID
 	chatType := resolved.ChatType
 	files := ext.files
 	if files == nil {
 		files = []any{}
+	}
+
+	// An image request is verified against upstream as a single-prompt, no-search,
+	// no-thinking turn; the text path keeps the agent-oriented defaults.
+	feature := map[string]any{
+		"output_schema":    "phase",
+		"thinking_enabled": resolved.Thinking,
+		"research_mode":    "normal",
+		"auto_thinking":    true,
+		"thinking_mode":    "Auto",
+		"thinking_format":  "summary",
+		"auto_search":      true,
+	}
+	meta := map[string]any{"subChatType": chatType}
+	if chatType == "t2i" {
+		feature["thinking_enabled"] = false
+		feature["auto_thinking"] = false
+		feature["thinking_mode"] = "Fast"
+		feature["auto_search"] = false
+		delete(feature, "thinking_format")
+	}
+	if size != "" {
+		meta["size"] = size
+	}
+
+	message := map[string]any{
+		"id":            nil,
+		"fid":           uuidv4(),
+		"parentId":      nil,
+		"parent_id":     nil,
+		"childrenIds":   []string{uuidv4()},
+		"role":          "user",
+		"content":       ext.content,
+		"user_action":   "chat",
+		"files":         files,
+		"timestamp":     now,
+		"models":        []string{model},
+		"model":         "",
+		"chat_type":     chatType,
+		"sub_chat_type": chatType,
+		"feature_config": feature,
+		"extra":         map[string]any{"meta": meta},
+	}
+	if size != "" {
+		message["size"] = size
 	}
 
 	body := map[string]any{
@@ -756,32 +907,7 @@ func buildUpstreamPayload(resolved resolvedModel, chatID string, ext externalize
 		"parent_id":          nil,
 		"parentId":           nil,
 		"timestamp":          now,
-		"messages": []map[string]any{{
-			"id":            nil,
-			"fid":           uuidv4(),
-			"parentId":      nil,
-			"parent_id":     nil,
-			"childrenIds":   []string{uuidv4()},
-			"role":          "user",
-			"content":       ext.content,
-			"user_action":   "chat",
-			"files":         files,
-			"timestamp":     now,
-			"models":        []string{model},
-			"model":         "",
-			"chat_type":     chatType,
-			"sub_chat_type": chatType,
-			"feature_config": map[string]any{
-				"output_schema":    "phase",
-				"thinking_enabled": resolved.Thinking,
-				"research_mode":    "normal",
-				"auto_thinking":    true,
-				"thinking_mode":    "Auto",
-				"thinking_format":  "summary",
-				"auto_search":      true,
-			},
-			"extra": map[string]any{"meta": map[string]any{"subChatType": chatType}},
-		}},
+		"messages":           []map[string]any{message},
 	}
 	return json.Marshal(body)
 }
@@ -820,7 +946,184 @@ func flattenMessages(msgs []chatMessage) string {
 	return b.String()
 }
 
+// --- OpenAI images API ----------------------------------------------------
+
+// imageRequest is the OpenAI /v1/images/generations body.
+type imageRequest struct {
+	Model          string `json:"model"`
+	Prompt         string `json:"prompt"`
+	Size           string `json:"size"`
+	ResponseFormat string `json:"response_format"`
+}
+
+// handleImageGeneration serves POST /v1/images/generations by running a t2i turn
+// upstream and returning the URL of the generated picture.
+//
+// The work is a single prompt, so it reuses the chat path's transport but skips
+// the conversation machinery. b64_json downloads and expands the PNG, which is
+// the allocation that forced a separate concurrency gate on this device.
+func (s *server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
+	rawBody, err := readAllLimited(r.Body, 64<<10)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "could not read body: "+err.Error())
+		return
+	}
+	var req imageRequest
+	if err := json.Unmarshal(rawBody, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "prompt is required")
+		return
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = "qwen3.8-max"
+	}
+
+	// One image request occupies both the global gate and the tighter image gate.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-r.Context().Done():
+		return
+	default:
+		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", "too many concurrent requests")
+		return
+	}
+	select {
+	case s.imageSem <- struct{}{}:
+		defer func() { <-s.imageSem }()
+	case <-r.Context().Done():
+		return
+	default:
+		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", "too many concurrent image requests")
+		return
+	}
+
+	resolved := resolveModel(model, s.cachedModels(), false)
+	resolved.ChatType = "t2i"
+
+	acct, err := s.pool.acquire(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", err.Error())
+		return
+	}
+
+	chatID, err := s.client.createChatID(r.Context(), acct, resolved.ID, "t2i")
+	if err != nil {
+		var ue *upstreamError
+		if errors.As(err, &ue) && (ue.Status == 401 || ue.Status == 403) {
+			s.pool.invalidate(acct)
+		}
+		log.Printf("images: create session failed for %s: %v", acct.Email, err)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "could not open an upstream conversation: "+err.Error())
+		return
+	}
+
+	ext := externalizeResult{content: req.Prompt, mode: "inline"}
+	payload, err := buildUpstreamPayloadSized(resolved, chatID, ext, normalizeImageSize(req.Size))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	upstream, err := s.client.chatStream(r.Context(), acct, chatID, payload)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "server_error", err.Error())
+		return
+	}
+	defer upstream.Close()
+
+	if upstream.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(upstream.Body, 4<<10))
+		log.Printf("images: upstream %d for %s: %s", upstream.StatusCode, acct.Email, strings.TrimSpace(string(body)))
+		writeJSONError(w, http.StatusBadGateway, "server_error", fmt.Sprintf("upstream returned %d", upstream.StatusCode))
+		return
+	}
+
+	acc := newStreamAccumulator()
+	if err := consumeUpstream(r.Context(), upstream.Body, acc); err != nil {
+		log.Printf("images: stream failed: %v", err)
+	}
+	if len(acc.images) == 0 {
+		log.Printf("images: no image URL in upstream stream (frames=%d raw=%d)", acc.frames, acc.raw)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "upstream produced no image")
+		return
+	}
+	url := acc.images[len(acc.images)-1]
+	log.Printf("images: generated for %s model=%s url_bytes=%d", acct.Email, resolved.ID, len(url))
+
+	item := map[string]any{"url": url}
+	if req.ResponseFormat == "b64_json" {
+		if encoded, err := s.downloadImageBase64(r.Context(), url); err == nil {
+			item = map[string]any{"b64_json": encoded}
+		} else {
+			log.Printf("images: b64 download failed, returning url instead: %v", err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"created": time.Now().Unix(),
+		"data":    []map[string]any{item},
+	})
+}
+
+// downloadImageBase64 fetches a generated picture and base64-encodes it. The
+// read is bounded by ImageMaxBytes: base64 expands by 4/3, and this device was
+// measured OOM-killing at a handful of multi-megabyte buffers.
+func (s *server) downloadImageBase64(ctx context.Context, url string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("asset fetch returned %d", resp.StatusCode)
+	}
+
+	limit := currentConfig.ImageMaxBytes
+	if limit <= 0 {
+		limit = 8 << 20
+	}
+	body, err := readAllLimited(resp.Body, int(limit)+1)
+	if err != nil {
+		return "", err
+	}
+	if int64(len(body)) > limit {
+		return "", fmt.Errorf("asset exceeds IMAGE_MAX_BYTES (%d)", limit)
+	}
+	return base64.StdEncoding.EncodeToString(body), nil
+}
+
 // --- small helpers --------------------------------------------------------
+
+// normalizeImageSize maps the pixel sizes OpenAI clients send onto the aspect
+// ratios Qwen expects, and passes an already-ratio value through unchanged.
+func normalizeImageSize(size string) string {
+	switch strings.TrimSpace(size) {
+	case "1024x1024":
+		return "1:1"
+	case "1536x1024":
+		return "4:3"
+	case "1024x1536":
+		return "3:4"
+	case "1792x1024":
+		return "16:9"
+	case "1024x1792":
+		return "9:16"
+	default:
+		return strings.TrimSpace(size)
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	b, err := json.Marshal(v)

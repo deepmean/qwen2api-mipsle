@@ -73,6 +73,10 @@ func TestNormalizeDeltaPhases(t *testing.T) {
 		{"reasoning_content implies think", map[string]any{"reasoning_content": "r"}, "think", "r", true},
 		{"no phase defaults to answer", map[string]any{"content": "x"}, "answer", "x", true},
 		{"final is an answer phase", map[string]any{"phase": "final", "content": "x"}, "answer", "x", true},
+		// A generated picture is carried as a URL on `content` under image_gen.
+		{"image url is an answer", map[string]any{"phase": "image_gen", "content": "https://cdn.example/a.png?k=1"}, "answer", "https://cdn.example/a.png?k=1", true},
+		// The terminal tick of an image answer carries no content.
+		{"image finished tick is dropped", map[string]any{"phase": "image_gen", "content": "", "status": "finished"}, "", "", false},
 		{"function role is dropped", map[string]any{"role": "function", "content": "tool"}, "", "", false},
 		{"empty delta is dropped", map[string]any{"phase": "answer"}, "", "", false},
 		{"nil delta is dropped", nil, "", "", false},
@@ -158,6 +162,66 @@ func TestHandleFrameAccumulates(t *testing.T) {
 	}
 	if acc.usage.InputTokens != 7 || acc.usage.OutputTokens != 2 {
 		t.Fatalf("usage = %+v", acc.usage)
+	}
+}
+
+// A generated picture is delivered as a URL on delta.content under phase
+// "image_gen". It must land in acc.images and stay out of the text answer, so a
+// client reading `content` never receives a bare URL where prose is expected.
+func TestHandleFrameCapturesImageURL(t *testing.T) {
+	acc := newStreamAccumulator()
+	// Verbatim shape observed from upstream for a t2i turn.
+	frames := []string{
+		`{"response.created":{"chat_id":"c1","response_id":"r1","response_index":"0"}}`,
+		`{"choices":[{"delta":{"role":"assistant","content":"https://cdn.qwenlm.ai/output/x/t2i/r1/1791626453a22f.png?key=eyJhbGci","phase":"image_gen","extra":{"output_image_hw":[[2048,2048]]},"status":"typing"}}],"usage":{"input_tokens":0,"output_tokens":0,"image_count":1,"width":2048,"height":2048}}`,
+		`{"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"image_gen"}}]}`,
+	}
+	for _, f := range frames {
+		if err := handleFrame(sseFrame{Data: f}, acc); err != nil {
+			t.Fatalf("handleFrame: %v", err)
+		}
+	}
+	if len(acc.images) != 1 {
+		t.Fatalf("images = %v, want exactly one URL", acc.images)
+	}
+	if want := "https://cdn.qwenlm.ai/output/x/t2i/r1/1791626453a22f.png?key=eyJhbGci"; acc.images[0] != want {
+		t.Fatalf("image URL = %q, want %q", acc.images[0], want)
+	}
+	// The URL must not leak into the prose channel.
+	if acc.content.Len() != 0 {
+		t.Fatalf("content = %q, want empty for an image turn", acc.content.String())
+	}
+	if acc.reasoning.Len() != 0 {
+		t.Fatalf("reasoning = %q, want empty", acc.reasoning.String())
+	}
+}
+
+// A t2i turn must reach a streaming client as content: the image is captured in
+// acc.images AND relayed through onImage, never through the prose callback.
+func TestImageDeltaReachesStreamCallback(t *testing.T) {
+	acc := newStreamAccumulator()
+	var prose, images []string
+	acc.onDelta = func(phase, content string) error {
+		prose = append(prose, phase+":"+content)
+		return nil
+	}
+	acc.onImage = func(url string) error {
+		images = append(images, url)
+		return nil
+	}
+	f := `{"choices":[{"delta":{"phase":"image_gen","content":"https://cdn.example/a.png"}}]}`
+	if err := handleFrame(sseFrame{Data: f}, acc); err != nil {
+		t.Fatalf("handleFrame: %v", err)
+	}
+	if len(acc.images) != 1 {
+		t.Fatalf("images = %v", acc.images)
+	}
+	if len(images) != 1 || images[0] != "https://cdn.example/a.png" {
+		t.Fatalf("onImage got %v, want the URL", images)
+	}
+	// An image is not prose, so the text callback must stay silent.
+	if len(prose) != 0 {
+		t.Fatalf("onDelta should not fire for an image frame, got %v", prose)
 	}
 }
 

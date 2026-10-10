@@ -12,12 +12,50 @@ Bun 没有 MIPS32 后端，OpenWrt 24.10 也没有 `mipsel_24kc` 的 `node` 包�
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /v1/models` | 实时拉取 Qwen 模型目录；拉取失败时回退到静态列表 |
-| `POST /v1/chat/completions` | 支持 `stream: true` 与 `stream: false` |
+| `GET /v1/models` | 实时拉取 Qwen 模型目录，并按 `chat_type` 能力合成 `-image` 变体；拉取失败时回退到静态列表 |
+| `POST /v1/chat/completions` | 支持 `stream: true` 与 `stream: false`；`-image` 后缀走生图 |
+| `POST /v1/images/generations` | OpenAI 生图接口，返回图片 URL（或 `b64_json`） |
 | `GET /health` | 运行时长、账号数量、各账号登录状态 |
 
 为控制内存占用，以下**未移植**：Anthropic 兼容层（`/v1/messages`）、
-工具调用协议、图片/视频生成、Web 管理面板。
+工具调用协议、图片编辑与视频生成、Web 管理面板。
+
+## 生图（t2i）
+
+上游目录只返回裸 id，`qwen3.8-max-image` 并不存在——`-image` 是本网关与 Qwen
+网页端共同用来选择"这个模型的生图能力"的**后缀约定**。因此 `/v1/models` 会读取
+上游 meta 里的 `chat_type`，凡是声明了 `t2i` 的模型都追加一个 `-image` 变体：
+
+```
+qwen3.8-max          ->  t2t（文本）
+qwen3.8-max-image    ->  t2i（生图）
+```
+
+生图结果**不需要独立传输**：上游把它当作普通 completion 流返回，图片 URL 落在
+`choices[0].delta.content` 上，`phase` 为 `image_gen`（实测响应约 1.5 KB）：
+
+```
+data: {"choices":[{"delta":{"role":"assistant",
+  "content":"https://cdn.qwenlm.ai/output/.../xxx.png?key=...",
+  "phase":"image_gen","status":"typing"}}]}
+```
+
+两条路径都能取到图片：`-image` 后缀经 `/v1/chat/completions` 把 URL 作为
+`content` 返回；`/v1/images/generations` 则返回 OpenAI 形状的 `data[].url`。
+
+### 内存与并发
+
+实测（JCG-Q20 / MT7621，250 MB RAM，约 73 MB 可用）：
+
+| 场景 | 峰值增量 | 结果 |
+| --- | --- | --- |
+| 单张生图 | +6 ~ 20 MB | 正常 |
+| 4 MiB × 4 并发缓冲 | — | OOM 被杀 |
+
+生图 URL 本身很轻，真正的开销在 `response_format: "b64_json"`——它要把 PNG 拉进
+内存再 base64 展开（4/3 倍）。所以生图有**独立于** `MAX_CONCURRENT` 的闸门
+`IMAGE_MAX_CONCURRENT`，默认 **2**；`b64_json` 的下载另受 `IMAGE_MAX_BYTES`
+约束（默认 8 MiB）。超出的请求返回 `429`。
 
 ## 长上下文附件
 
@@ -58,6 +96,9 @@ Qwen 的 WAF 会对客户端做指纹识别，因此决定请求成败的部分�
   均由账号邮箱的 SHA-256 确定性派生，同一账号始终呈现同一套一致身份。
 - **请求头画像** —— `user-agent`、`sec-ch-ua`、`sec-ch-ua-platform`、
   `accept-language`、`sec-fetch-*`、`timezone`、`source: web`、`version: 0.2.81`。
+  版本号刻意**不跟随**线上 FE 构建（2026-10 已到 0.3.12）：接口只接受与 ssxmod
+  指纹模板一致的版本，单独把版本改成 0.3.12 会让 `chats/new` 返回
+  `Unauthorized`。改版本号必须同步升级 `ssxmod.go` 的指纹模板。
 - **`feature_config.output_schema: "phase"`** —— 关键字段。缺失则上游不再返回
   `delta.phase`，所有增量帧被丢弃。
 - **两通道输出** —— 推理内容进 `reasoning_content`，正文进 `content`，与上游默认
@@ -138,6 +179,8 @@ curl http://192.168.26.1:3000/v1/chat/completions \
 | `QWEN_CHAT_PROXY_URL` | `https://chat.qwen.ai` | 上游地址 |
 | `ACCOUNTS_FILE` | `/opt/qwen2api/accounts.txt` | 账号文件 |
 | `MAX_CONCURRENT` | `8` | 并发对话请求上限 |
+| `IMAGE_MAX_CONCURRENT` | `2` | 并发生图请求上限（独立闸门，见"内存与并发"） |
+| `IMAGE_MAX_BYTES` | `8388608` | `b64_json` 单张图片下载上限（字节） |
 | `AGENT_CONTEXT_PREFIX_TTL_SECONDS` | `1800` | 已上传历史附件的可复用时长 |
 | `AGENT_CONTEXT_PREFIX_MAX_ENTRIES` | `8` | 缓存附件的会话数 |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` |

@@ -71,12 +71,34 @@ func TestResolveModelSuffixDrivesBehaviour(t *testing.T) {
 	}
 }
 
+// -image is now served (t2i): upstream answers it on the ordinary stream with the
+// picture URL on delta.content under phase "image_gen". The modalities that
+// genuinely need machinery this port lacks stay rejected.
 func TestResolveModelRejectsUnimplementedModalities(t *testing.T) {
-	for _, name := range []string{"qwen3.8-max-image", "qwen3.8-max-video", "qwen3.8-max-deep-research"} {
+	for _, name := range []string{"qwen3.8-max-image-edit", "qwen3.8-max-video", "qwen3.8-max-deep-research"} {
 		r := resolveModel(name, nil, false)
 		if r.Unsupported == "" {
 			t.Errorf("%s should be reported unsupported, got ID=%q", name, r.ID)
 		}
+	}
+}
+
+// The image capability is selected by the -image suffix and must map to the t2i
+// chat_type, with the suffix stripped from the name sent upstream.
+func TestResolveModelRoutesImageSuffixToT2I(t *testing.T) {
+	r := resolveModel("qwen3.8-max-image", nil, false)
+	if r.Unsupported != "" {
+		t.Fatalf("qwen3.8-max-image must be supported, got unsupported=%q", r.Unsupported)
+	}
+	if r.ID != "qwen3.8-max" {
+		t.Fatalf("ID = %q, want qwen3.8-max", r.ID)
+	}
+	if r.ChatType != "t2i" {
+		t.Fatalf("ChatType = %q, want t2i", r.ChatType)
+	}
+	// A generated picture is not a reasoning answer.
+	if r.Thinking {
+		t.Fatal("thinking must stay off for an image request")
 	}
 }
 

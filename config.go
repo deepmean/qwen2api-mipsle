@@ -35,6 +35,16 @@ type config struct {
 	// MaxConcurrent bounds in-flight chat requests. The device has ~80MB free
 	// RAM; each streamed answer costs a few hundred KB of buffers.
 	MaxConcurrent int
+	// ImageMaxConcurrent bounds in-flight image-generation requests separately
+	// from MaxConcurrent. A t2i answer is a URL on the ordinary stream, so the
+	// streaming path is cheap; the expensive variant is b64_json, which
+	// downloads the PNG and base64-expands it (4/3 of the file) in RAM. Measured
+	// on the JCG-Q20: 4 MiB x 8 concurrent buffers was OOM-killed, while the
+	// same total at 2 concurrent stays well inside the ~73MB available.
+	ImageMaxConcurrent int
+	// ImageMaxBytes caps the downloaded asset when a caller asks for b64_json,
+	// so one large picture cannot grow the heap without bound.
+	ImageMaxBytes int64
 	// PrefixCacheTTLSec bounds how long an uploaded history attachment may be
 	// reused. An expired Qwen file_id does not error — the model just answers
 	// without it — so reuse is capped by the document's own lifetime.
@@ -51,6 +61,8 @@ func defaultConfig() config {
 		QwenChatBase:          "https://chat.qwen.ai",
 		RequestTimeoutSec:     600,
 		MaxConcurrent:         8,
+		ImageMaxConcurrent:    2,
+		ImageMaxBytes:         8 << 20,
 		PrefixCacheTTLSec:     1800,
 		PrefixCacheMaxEntries: 8,
 		LogLevel:              "INFO",
@@ -88,6 +100,18 @@ func loadConfig() (config, error) {
 		var n int
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			c.MaxConcurrent = n
+		}
+	}
+	if v := os.Getenv("IMAGE_MAX_CONCURRENT"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			c.ImageMaxConcurrent = n
+		}
+	}
+	if v := os.Getenv("IMAGE_MAX_BYTES"); v != "" {
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			c.ImageMaxBytes = n
 		}
 	}
 	if v := os.Getenv("AGENT_CONTEXT_PREFIX_TTL_SECONDS"); v != "" {

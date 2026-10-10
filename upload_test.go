@@ -39,7 +39,7 @@ func TestOSSSignatureMatchesReference(t *testing.T) {
 }
 
 func TestSTSResponseUnwrapsEnvelope(t *testing.T) {
-	// FE 0.2.81 wraps the payload as {success,data}; older builds return it flat.
+	// Current FE builds wrap the payload as {success,data}; older ones return it flat.
 	wrapped := `{"success":true,"data":{"access_key_id":"a","access_key_secret":"b","security_token":"c","file_path":"k","bucketname":"bk","endpoint":"ep","file_id":"fid","file_url":"u"}}`
 	var s stsResponse
 	if err := json.Unmarshal([]byte(wrapped), &s); err != nil {
