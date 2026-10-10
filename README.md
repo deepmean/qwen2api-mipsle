@@ -1,5 +1,7 @@
 # qwen2api（MIPS32 移植版）
 
+[![build](https://github.com/deepmean/qwen2api-mipsle/actions/workflows/build.yml/badge.svg)](https://github.com/deepmean/qwen2api-mipsle/actions/workflows/build.yml)
+
 把 [Qwen](https://chat.qwen.ai) 网页版封装成 **OpenAI 兼容 API** 的极简网关，
 交叉编译为单一静态二进制，运行在 **MIPS32 小端 OpenWrt 路由器**上
 （MediaTek MT7621 / `ramips`，实测机型 JCG-Q20）。
@@ -7,6 +9,8 @@
 上游 [deepmean/Qwen2API](https://github.com/deepmean/Qwen2API) 是 Bun/Node 应用。
 Bun 没有 MIPS32 后端，OpenWrt 24.10 也没有 `mipsel_24kc` 的 `node` 包，
 因此核心对话链路用 **Go 纯标准库重写**，交叉编译为静态二进制。
+
+二进制由 **GitHub Actions 云编译**产出，本地无需安装 Go（见[构建](#构建)）。
 
 ## 接口范围
 
@@ -110,17 +114,64 @@ Qwen 的 WAF 会对客户端做指纹识别，因此决定请求成败的部分�
 
 ## 构建
 
+**二进制由 GitHub Actions 云编译产出，本地不需要安装 Go。**
+
+工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)
+
+| 触发 | 行为 |
+| --- | --- |
+| push 到 `main` | 测试 + 编译，并更新滚动预发布 `latest` |
+| 打 `v*` 标签 | 测试 + 编译，并发布正式 release（自动生成 release notes） |
+| Pull Request | 仅测试 + 编译（不发布） |
+| 手动 | Actions 页面 → build → Run workflow |
+
+固定下载地址（可直接拉到路由器）：
+
+```sh
+wget -O /tmp/qwen2api.new \
+  https://github.com/deepmean/qwen2api-mipsle/releases/download/latest/qwen2api-linux-mipsle
+chmod +x /tmp/qwen2api.new
+```
+
+工作流分两个 job，`build` 依赖 `test`：
+
+1. **test** —— `go vet ./...` 与 `go test ./...`。测试含 Cookie 编码器与上游
+   JavaScript 的**逐字节**交叉校验，是最容易在无声中失效的部分。
+2. **build** —— 以 `GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0`
+   交叉编译，然后**校验产物**再上传。
+
+### 产物校验
+
+编译后会解析 ELF 并断言，任何一条不符即失败，坏二进制进不了 release：
+
+| 断言 | 不满足的后果 |
+| --- | --- |
+| `ELF32` | 内核拒绝执行 |
+| little endian | 内核拒绝执行 |
+| `Machine: MIPS` | 内核拒绝执行 |
+| `FP ABI: Soft float` | **能启动，首次用浮点即崩溃** |
+| 无 `PT_INTERP`（静态） | 路由器上没有匹配的解释器 |
+
+`GOMIPS=softfloat` 是**必须的**：MT7621 无 FPU，硬浮点构建会在运行时崩溃。
+Go 链接器在 `GOMIPS=softfloat` 时把 `.MIPS.abiflags` 的 `fp_abi` 写成 `3`，
+binutils 将其显示为 `FP ABI: Soft float`。
+
+产物约 6 MB，静态链接，仅用 Go 标准库，**无需下载任何模块**。
+
+### 本地构建（可选）
+
+仅在需要本地调试时使用；仓库不依赖本地 Go：
+
 ```sh
 export GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0
 go build -trimpath -ldflags "-s -w" -o dist/qwen2api-linux-mipsle .
+go test ./...
 ```
 
-`GOMIPS=softfloat` 是**必须的**：MT7621 无 FPU，硬浮点构建会在运行时崩溃。
-产物约 6 MB，静态链接，仅用 Go 标准库，无需下载任何模块。
-
-```sh
-go test ./...   # 含 Cookie 编码器与上游 JS 的交叉校验
-```
+> 注意：本地构建会把当前 git 状态写进 `.go.buildinfo`（`vcs.revision` /
+> `vcs.modified`）。因此**同一份源码在本地与 CI 产出的二进制哈希不同**——
+> 这是 `-trimpath` 保留 VCS 戳的正常现象，不是构建不一致。CI 从干净树构建，
+> `vcs.modified=false`，是更规范的那一份。
 
 ## 部署（OpenWrt）
 
@@ -132,13 +183,19 @@ go test ./...   # 含 Cookie 编码器与上游 JS 的交叉校验
 | `/etc/init.d/qwen2api` | procd 服务脚本 |
 
 ```sh
-scp dist/qwen2api-linux-mipsle root@ROUTER:/opt/qwen2api/qwen2api
-scp deploy/init.d-qwen2api       root@ROUTER:/etc/init.d/qwen2api
+# 直接从 CI 下载（推荐）
+wget -O /tmp/qwen2api.new \
+  https://github.com/deepmean/qwen2api-mipsle/releases/download/latest/qwen2api-linux-mipsle
+scp /tmp/qwen2api.new          root@ROUTER:/opt/qwen2api/qwen2api
+scp deploy/init.d-qwen2api     root@ROUTER:/etc/init.d/qwen2api
 chmod +x /opt/qwen2api/qwen2api /etc/init.d/qwen2api
 /etc/init.d/qwen2api enable
 /etc/init.d/qwen2api start
 logread -e qwen2api
 ```
+
+> 升级前先备份现网二进制（`cp qwen2api qwen2api.bak`），并核对哈希：
+> 用 `md5sum` 比对路由器上的文件与 release 中的文件，确认部署的正是 CI 产物。
 
 填入账号后重启：
 
@@ -200,14 +257,14 @@ user2@example.com:pass:with:colons
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.go` | HTTP 服务器、路由、鉴权、流式转发、外置调度 |
+| `main.go` | HTTP 服务器、路由、鉴权、流式转发、外置调度、生图端点与图片并发闸门 |
 | `attach.go` | 上下文外置编排：会话切分、前缀缓存、复用匹配、熔断、压缩兜底 |
 | `upload.go` | STS Token → OSS 上传 → parse → 轮询；`message.files` 描述符 |
 | `context.go` | 有损压缩（附件不可用时的兜底） |
 | `qwen.go` | 上游客户端：登录、建会话、补全、模型目录、浏览器头构造 |
-| `sse.go` | SSE 解码 + delta 规范化（含 `thinking_summary` 通道） |
+| `sse.go` | SSE 解码 + delta 规范化（含 `thinking_summary` 与 `image_gen` 通道） |
 | `ssxmod.go` | SSXMOD Cookie 生成（LZW + 自定义 Base64 + 指纹） |
-| `model.go` | 模型名规范化与别名解析 |
+| `model.go` | 模型名规范化与别名解析（含 `-image` → `t2i`） |
 | `pool.go` | 账号轮询池 + JWT 懒登录与刷新 |
 | `transport.go` | `net/http` 传输层（显式 gzip/deflate 解压） |
 | `config.go` | 配置加载与账号文件解析 |

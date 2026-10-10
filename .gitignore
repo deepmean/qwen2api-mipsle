@@ -14,8 +14,10 @@ qwen2api.conf
 *.out
 *.exe
 
-# Locally unpacked Go toolchain (windows-arm64), used to cross-build the mipsle
-# binary. Not part of the project.
+# Locally unpacked Go toolchain. Normally absent: the release binary is built by
+# GitHub Actions (.github/workflows/build.yml), so a working tree with no Go
+# installed is the expected state. Ignored in case one is unpacked for local
+# debugging.
 .toolchain/
 
 # Session transcript (working notes, not part of the project)
