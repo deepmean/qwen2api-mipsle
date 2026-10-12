@@ -383,6 +383,12 @@ func isWAFError(err error) bool {
 type externalizeResult struct {
 	// content is the inline message text.
 	content string
+	// parts, when non-nil, is a structured content array sent upstream instead of
+	// content. An image-edit turn needs it: the upstream expects the caller's
+	// picture as a content part ({type:"text"} + {type:"image",image:url}),
+	// verified by measurement — a bare files[] entry with the same URL does not
+	// carry the picture.
+	parts []any
 	// files is the message.files list (nil when nothing was attached).
 	files []any
 	// mode records which path was taken, for logging.

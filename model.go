@@ -61,16 +61,22 @@ func splitModelSuffix(model string) (base, suffix string) {
 
 // chatTypeForSuffix maps a behavioural suffix onto the upstream chat_type.
 //
-// `-image` selects t2i (text-to-image). The upstream answers it on the ordinary
-// completions stream: the generated picture arrives as a URL in
-// `choices[0].delta.content` with `phase: "image_gen"`, so it needs no separate
-// transport — see the note on deltaNormalizer.
+// `-image` selects t2i (text-to-image) and `-image-edit` selects image_edit
+// (edit the picture the caller supplies). Both are answered on the ordinary
+// completions stream: the resulting picture arrives as a URL in
+// `choices[0].delta.content` with `phase: "image_gen"`, so neither needs a
+// separate transport — see the note on deltaNormalizer.
+//
+// image_edit additionally requires the caller's input picture to be carried in
+// message.files as {type:"image", url}; see uploadMedia.
 func chatTypeForSuffix(suffix string) string {
 	switch suffix {
 	case "-search", "-thinking-search":
 		return "search"
 	case "-image":
 		return "t2i"
+	case "-image-edit":
+		return "image_edit"
 	default:
 		return "t2t"
 	}
@@ -80,14 +86,11 @@ func chatTypeForSuffix(suffix string) string {
 // not implement, so the caller can fail loudly instead of silently answering
 // with text for a request it cannot serve.
 //
-// -image-edit needs the caller's input picture carried in message.files, which
-// this build does not parse (chatMessage.text drops non-text parts), so it would
-// silently edit nothing. -video needs task polling over a multi-minute window,
-// which is a different lifecycle. Both stay rejected on purpose.
+// -video needs task polling over a multi-minute window, which is a different
+// lifecycle from a streamed answer. -deep-research is a multi-stage upstream
+// flow. Both stay rejected on purpose.
 func unsupportedChatType(suffix string) (string, bool) {
 	switch suffix {
-	case "-image-edit":
-		return "image editing", true
 	case "-video":
 		return "video generation", true
 	case "-deep-research":

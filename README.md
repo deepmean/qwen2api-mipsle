@@ -16,26 +16,31 @@ Bun 没有 MIPS32 后端，OpenWrt 24.10 也没有 `mipsel_24kc` 的 `node` 包�
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /v1/models` | 实时拉取 Qwen 模型目录，并按 `chat_type` 能力合成 `-image` 变体；拉取失败时回退到静态列表 |
-| `POST /v1/chat/completions` | 支持 `stream: true` 与 `stream: false`；`-image` 后缀走生图 |
+| `GET /v1/models` | 实时拉取 Qwen 模型目录，并按 `chat_type` 能力合成 `-image` / `-image-edit` 变体；拉取失败时回退到静态列表 |
+| `POST /v1/chat/completions` | 支持 `stream: true` 与 `stream: false`；`-image` 走生图，`-image-edit` 走改图 |
 | `POST /v1/images/generations` | OpenAI 生图接口，返回图片 URL（或 `b64_json`） |
+| `POST /v1/images/edits` | OpenAI 改图接口（multipart），提交图片 + 指令，返回改后图片 URL |
 | `GET /health` | 运行时长、账号数量、各账号登录状态 |
 
 为控制内存占用，以下**未移植**：Anthropic 兼容层（`/v1/messages`）、
-工具调用协议、图片编辑与视频生成、Web 管理面板。
+工具调用协议、视频生成、Web 管理面板。
 
-## 生图（t2i）
+## 生图与改图（t2i / image_edit）
 
-上游目录只返回裸 id，`qwen3.8-max-image` 并不存在——`-image` 是本网关与 Qwen
-网页端共同用来选择"这个模型的生图能力"的**后缀约定**。因此 `/v1/models` 会读取
-上游 meta 里的 `chat_type`，凡是声明了 `t2i` 的模型都追加一个 `-image` 变体：
+上游目录只返回裸 id，`qwen3.8-max-image` 并不存在——`-image` / `-image-edit`
+是本网关与 Qwen 网页端共同用来选择"这个模型某能力"的**后缀约定**。因此
+`/v1/models` 会读取上游 meta 里的 `chat_type`，按能力追加变体：
 
 ```
-qwen3.8-max          ->  t2t（文本）
-qwen3.8-max-image    ->  t2i（生图）
+qwen3.8-max             ->  t2t（文本）
+qwen3.8-max-image       ->  t2i（生图）
+qwen3.8-max-image-edit  ->  image_edit（改图，需提交输入图）
 ```
 
-生图结果**不需要独立传输**：上游把它当作普通 completion 流返回，图片 URL 落在
+变体是**能力驱动**的：`qwen3.8-omni-flash` 的 `chat_type` 里没有 `image_edit`，
+所以它只出 `-image`，不出 `-image-edit`。
+
+两种结果**都不需要独立传输**：上游把它当作普通 completion 流返回，图片 URL 落在
 `choices[0].delta.content` 上，`phase` 为 `image_gen`（实测响应约 1.5 KB）：
 
 ```
@@ -44,22 +49,64 @@ data: {"choices":[{"delta":{"role":"assistant",
   "phase":"image_gen","status":"typing"}}]}
 ```
 
-两条路径都能取到图片：`-image` 后缀经 `/v1/chat/completions` 把 URL 作为
-`content` 返回；`/v1/images/generations` 则返回 OpenAI 形状的 `data[].url`。
+取图路径：
+
+- `-image` / `-image-edit` 经 `/v1/chat/completions`，URL 作为 `content` 返回；
+- `/v1/images/generations`、`/v1/images/edits` 返回 OpenAI 形状的 `data[].url`。
+
+### 改图怎么传输入图
+
+**输入图必须作为 content 数组里的一个 part 传，不能放 `message.files`。**
+
+这是实测确定的，不是照抄上游注释——两处上游源码给了互相矛盾的说法，所以两种形状
+都在真机上跑过，并用**可判定的对照**验证模型确实看到了图：
+
+- 输入图是纯品红，指令只说"在中心加一个黑点"，全程不提颜色；
+- 返回图 **99.8% 是品红** → 模型确实读了输入图；
+- 同一句指令走 t2i（不给图）→ **0% 品红**，证明提示词本身产不出这个颜色。
+
+因此本实现发送 `content: [{type:"text",...}, {type:"image",image:<url>}]`。
+`data:` URI 会先上传到 Qwen OSS 换成 https URL（上游按 URL 取图）；已经是 http(s)
+的图直接透传。
 
 ### 内存与并发
 
-实测（JCG-Q20 / MT7621，250 MB RAM，约 73 MB 可用）：
+实测（JCG-Q20 / MT7621，250 MB RAM，约 70 MB 可用）：
 
-| 场景 | 峰值增量 | 结果 |
+| 场景 | 默认 GC | GOGC=30 |
 | --- | --- | --- |
-| 单张生图 | +6 ~ 20 MB | 正常 |
-| 4 MiB × 4 并发缓冲 | — | OOM 被杀 |
+| 单张生图（URL 路径） | +6 ~ 20 MB | — |
+| 改图 769 KiB 图 × 1 | +9.0 MB | — |
+| 改图 1 MiB 图 × 2 | +18.1 MB | +13.7 MB |
+| 改图 3 MiB 图 × 2 | +64.6 MB | +42.4 MB |
+| 改图 4 MiB 图 × 2（上限） | **+72.5 MB ⚠️** | +45.2 MB |
+| 4 MiB × 4 并发缓冲（对照） | — | OOM 被杀 |
 
-生图 URL 本身很轻，真正的开销在 `response_format: "b64_json"`——它要把 PNG 拉进
-内存再 base64 展开（4/3 倍）。所以生图有**独立于** `MAX_CONCURRENT` 的闸门
-`IMAGE_MAX_CONCURRENT`，默认 **2**；`b64_json` 的下载另受 `IMAGE_MAX_BYTES`
-约束（默认 8 MiB）。超出的请求返回 `429`。
+关键点：**改图的峰值不是图片本身的大小**。请求体里是 base64（4/3 倍），解析后
+还要留一份 content 数组的副本，解码再产生一份原始字节；Go 的 GC 默认允许堆涨到
+存活量的约两倍才回收，于是 4 MiB 的图在 2 并发下能吃到 72.5 MB——正好是全部余量。
+
+所以有两道约束：
+
+1. **`GOGC=30`**（代码内置默认，环境变量可覆盖）。上表最后一列就是它的效果：
+   最坏情况从 72.5 MB 降到 45.2 MB，代价是更频繁的 GC 占一点 CPU——在这台设备上
+   CPU 比内存便宜。
+2. **独立闸门 `IMAGE_MAX_CONCURRENT`（默认 2）**，`t2i` 与 `image_edit` 共用。
+   超出的请求返回 `429`，不会排队堆积。
+
+另有三个上限兜住单次请求：`CHAT_MAX_BODY_BYTES`（请求体，默认 8 MiB，超限返回
+`413`）、`IMAGE_MAX_UPLOAD_BYTES`（输入图解码后，默认 4 MiB）、`IMAGE_MAX_BYTES`
+（`b64_json` 下载，默认 8 MiB）。
+
+> 注意 Go 运行时不会把峰值内存还给操作系统：一次大图改图后进程 RSS 会停在峰值。
+> 这是正常的，但意味着**余量要按峰值算**，不能按当前 RSS 算。
+
+### 每日配额
+
+上游对每个账号有**每日用量上限**，超出后返回
+`{"success":false,"data":{"code":"RateLimited",...}}`。账号池会轮换，所以总容量是
+账号数的倍数。该信封已被识别并映射为 `502 + RateLimited`——否则它会表现成
+HTTP 200 的空回复。
 
 ## 长上下文附件
 
@@ -225,6 +272,24 @@ curl http://192.168.26.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-max","stream":true,
        "messages":[{"role":"user","content":"你好"}]}'
+
+# 生图
+curl http://192.168.26.1:3000/v1/images/generations \
+  -H 'Authorization: Bearer sk-your-key' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-max","prompt":"a red apple","size":"1024x1024"}'
+
+# 改图（OpenAI multipart 形状）
+curl http://192.168.26.1:3000/v1/images/edits \
+  -H 'Authorization: Bearer sk-your-key' \
+  -F model=qwen3.8-max -F 'prompt=make the background blue' \
+  -F image=@photo.png
+
+# 改图（chat 形状，图片作为 content part）
+curl http://192.168.26.1:3000/v1/chat/completions \
+  -H 'Authorization: Bearer sk-your-key' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-max-image-edit","messages":[{"role":"user","content":[
+        {"type":"text","text":"make the background blue"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'
 ```
 
 ## 配置
@@ -236,8 +301,11 @@ curl http://192.168.26.1:3000/v1/chat/completions \
 | `QWEN_CHAT_PROXY_URL` | `https://chat.qwen.ai` | 上游地址 |
 | `ACCOUNTS_FILE` | `/opt/qwen2api/accounts.txt` | 账号文件 |
 | `MAX_CONCURRENT` | `8` | 并发对话请求上限 |
-| `IMAGE_MAX_CONCURRENT` | `2` | 并发生图请求上限（独立闸门，见"内存与并发"） |
+| `IMAGE_MAX_CONCURRENT` | `2` | 并发图片请求上限（`t2i` 与 `image_edit` 共用，见"内存与并发"） |
+| `CHAT_MAX_BODY_BYTES` | `8388608` | `/v1/chat/completions` 请求体上限；base64 图是文件的 4/3 倍 |
+| `IMAGE_MAX_UPLOAD_BYTES` | `4194304` | 改图输入图解码后的大小上限 |
 | `IMAGE_MAX_BYTES` | `8388608` | `b64_json` 单张图片下载上限（字节） |
+| `GOGC` | `30`（代码内置） | Go GC 触发比。设了环境变量则覆盖；调高省 CPU、费内存 |
 | `AGENT_CONTEXT_PREFIX_TTL_SECONDS` | `1800` | 已上传历史附件的可复用时长 |
 | `AGENT_CONTEXT_PREFIX_MAX_ENTRIES` | `8` | 缓存附件的会话数 |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
@@ -257,14 +325,14 @@ user2@example.com:pass:with:colons
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.go` | HTTP 服务器、路由、鉴权、流式转发、外置调度、生图端点与图片并发闸门 |
+| `main.go` | HTTP 服务器、路由、鉴权、流式转发、外置调度、生图/改图端点与图片并发闸门 |
 | `attach.go` | 上下文外置编排：会话切分、前缀缓存、复用匹配、熔断、压缩兜底 |
-| `upload.go` | STS Token → OSS 上传 → parse → 轮询；`message.files` 描述符 |
+| `upload.go` | STS Token → OSS 上传 → parse → 轮询；`message.files` 描述符；改图输入图上传（不 parse） |
 | `context.go` | 有损压缩（附件不可用时的兜底） |
 | `qwen.go` | 上游客户端：登录、建会话、补全、模型目录、浏览器头构造 |
 | `sse.go` | SSE 解码 + delta 规范化（含 `thinking_summary` 与 `image_gen` 通道） |
 | `ssxmod.go` | SSXMOD Cookie 生成（LZW + 自定义 Base64 + 指纹） |
-| `model.go` | 模型名规范化与别名解析（含 `-image` → `t2i`） |
+| `model.go` | 模型名规范化与别名解析（`-image` → `t2i`，`-image-edit` → `image_edit`） |
 | `pool.go` | 账号轮询池 + JWT 懒登录与刷新 |
 | `transport.go` | `net/http` 传输层（显式 gzip/deflate 解压） |
 | `config.go` | 配置加载与账号文件解析 |

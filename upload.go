@@ -72,7 +72,7 @@ func uploadAgentContext(ctx context.Context, c *qwenClient, acct *account, text,
 		filename = fmt.Sprintf("QWEN2API_AGENT_HISTORY_%d.txt", time.Now().UnixMilli())
 	}
 
-	sts, err := c.requestSTSToken(ctx, acct, filename, len(content))
+	sts, err := c.requestSTSToken(ctx, acct, filename, len(content), "file")
 	if err != nil {
 		return nil, err
 	}
@@ -85,12 +85,73 @@ func uploadAgentContext(ctx context.Context, c *qwenClient, acct *account, text,
 	return buildChatFileDescriptor(sts.FileID, sts.FileURL, filename, len(content)), nil
 }
 
+// uploadMedia uploads binary media — the input picture of an image-edit turn —
+// to Qwen's OSS and returns the message.files entry that references it.
+//
+// Two differences from uploadAgentContext:
+//
+//   - NO parse step. A document must be parsed before the model can read it; an
+//     image is fetched from the stored object directly, and the upstream has no
+//     parse path for it.
+//   - The descriptor is the short {type,url} pair. That is the only shape the
+//     upstream accepts for an image in files[] (verified upstream: it is what the
+//     Qwen web client's image_edit path pushes).
+//
+// The caller must supply the real contentType: it is signed into the OSS
+// request and determines the stored object's type.
+func uploadMedia(ctx context.Context, c *qwenClient, acct *account, data []byte, filename, contentType string) (map[string]any, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("media is empty")
+	}
+	if len(data) > maxUploadBytes {
+		return nil, fmt.Errorf("media exceeds %d bytes", maxUploadBytes)
+	}
+	if filename == "" {
+		filename = uuidv4() + ".png"
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	sts, err := c.requestSTSToken(ctx, acct, filename, len(data), simpleFileType(contentType))
+	if err != nil {
+		return nil, err
+	}
+	if err := c.putObjectTyped(ctx, sts, data, contentType); err != nil {
+		return nil, err
+	}
+	if sts.FileURL == "" {
+		return nil, fmt.Errorf("media upload returned no file url")
+	}
+	return map[string]any{"type": "image", "url": sts.FileURL}, nil
+}
+
+// simpleFileType maps a MIME type onto the simple type getstsToken expects.
+// Mirrors upstream getSimpleFileType: the main type when it is a type the
+// endpoint knows, otherwise "file".
+func simpleFileType(contentType string) string {
+	main := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, "/", 2)[0]))
+	switch main {
+	case "image", "video", "audio":
+		return main
+	default:
+		return "file"
+	}
+}
+
 // requestSTSToken asks Qwen for temporary OSS credentials scoped to one object.
-func (c *qwenClient) requestSTSToken(ctx context.Context, acct *account, filename string, filesize int) (*stsResponse, error) {
+//
+// filetype is the *simple* type the upstream expects ("file", "image", "video",
+// ...), which it uses to size the upload allowance. It defaults to "file", which
+// is what the document path has always sent.
+func (c *qwenClient) requestSTSToken(ctx context.Context, acct *account, filename string, filesize int, filetype string) (*stsResponse, error) {
+	if filetype == "" {
+		filetype = "file"
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"filename": filename,
 		"filesize": filesize,
-		"filetype": "file",
+		"filetype": filetype,
 	})
 
 	url := chatBase() + "/api/v1/files/getstsToken"
@@ -126,7 +187,12 @@ func (c *qwenClient) requestSTSToken(ctx context.Context, acct *account, filenam
 	return s, nil
 }
 
-// putObject uploads the document to Aliyun OSS with a Signature-V1 Authorization
+// putObject uploads a document to Aliyun OSS as text/plain.
+func (c *qwenClient) putObject(ctx context.Context, sts *stsResponse, content []byte) error {
+	return c.putObjectTyped(ctx, sts, content, "text/plain")
+}
+
+// putObjectTyped uploads bytes to Aliyun OSS with a Signature-V1 Authorization
 // header, which is what the STS credentials and the upstream ali-oss client use.
 //
 // The canonical string is:
@@ -136,12 +202,18 @@ func (c *qwenClient) requestSTSToken(ctx context.Context, acct *account, filenam
 //	<Content-Type>\n
 //	<Date>\n
 //	<CanonicalizedOSSHeaders>/<bucket>/<key>
-func (c *qwenClient) putObject(ctx context.Context, sts *stsResponse, content []byte) error {
+//
+// contentType is part of the signature, so it must be the value actually sent:
+// an image uploaded as text/plain would be signed correctly but stored with the
+// wrong type, and Qwen reads the stored type when the model fetches it.
+func (c *qwenClient) putObjectTyped(ctx context.Context, sts *stsResponse, content []byte, contentType string) error {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 	host := sts.BucketName + "." + sts.Endpoint
 	url := "https://" + host + "/" + sts.FilePath
 
 	date := time.Now().UTC().Format(httpTimeFormat)
-	const contentType = "text/plain"
 
 	canonical := "PUT\n\n" + contentType + "\n" + date + "\n" +
 		"x-oss-security-token:" + sts.SecurityToken + "\n" +

@@ -71,11 +71,11 @@ func TestResolveModelSuffixDrivesBehaviour(t *testing.T) {
 	}
 }
 
-// -image is now served (t2i): upstream answers it on the ordinary stream with the
-// picture URL on delta.content under phase "image_gen". The modalities that
-// genuinely need machinery this port lacks stay rejected.
+// Both picture modalities are served now: the upstream answers t2i and
+// image_edit on the ordinary stream with the URL on delta.content under phase
+// "image_gen". What stays rejected is what needs machinery this port lacks.
 func TestResolveModelRejectsUnimplementedModalities(t *testing.T) {
-	for _, name := range []string{"qwen3.8-max-image-edit", "qwen3.8-max-video", "qwen3.8-max-deep-research"} {
+	for _, name := range []string{"qwen3.8-max-video", "qwen3.8-max-deep-research"} {
 		r := resolveModel(name, nil, false)
 		if r.Unsupported == "" {
 			t.Errorf("%s should be reported unsupported, got ID=%q", name, r.ID)
@@ -99,6 +99,40 @@ func TestResolveModelRoutesImageSuffixToT2I(t *testing.T) {
 	// A generated picture is not a reasoning answer.
 	if r.Thinking {
 		t.Fatal("thinking must stay off for an image request")
+	}
+}
+
+// -image-edit must win over -image: the suffix table is longest-first, so
+// `qwen3.8-max-image-edit` is an edit turn, not a t2i turn on a model named
+// "qwen3.8-max-image".
+func TestResolveModelRoutesImageEditSuffix(t *testing.T) {
+	r := resolveModel("qwen3.8-max-image-edit", nil, false)
+	if r.Unsupported != "" {
+		t.Fatalf("qwen3.8-max-image-edit must be supported, got unsupported=%q", r.Unsupported)
+	}
+	if r.ID != "qwen3.8-max" {
+		t.Fatalf("ID = %q, want qwen3.8-max", r.ID)
+	}
+	if r.ChatType != "image_edit" {
+		t.Fatalf("ChatType = %q, want image_edit", r.ChatType)
+	}
+	if r.Thinking {
+		t.Fatal("thinking must stay off for an edit request")
+	}
+}
+
+// Both picture chat types take the tighter concurrency gate and the asset
+// feature profile; text types take neither.
+func TestIsImageChatType(t *testing.T) {
+	for _, ct := range []string{"t2i", "image_edit"} {
+		if !isImageChatType(ct) {
+			t.Errorf("%s should be an image chat type", ct)
+		}
+	}
+	for _, ct := range []string{"t2t", "search", "t2v", ""} {
+		if isImageChatType(ct) {
+			t.Errorf("%s should not be an image chat type", ct)
+		}
 	}
 }
 

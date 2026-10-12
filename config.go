@@ -45,6 +45,15 @@ type config struct {
 	// ImageMaxBytes caps the downloaded asset when a caller asks for b64_json,
 	// so one large picture cannot grow the heap without bound.
 	ImageMaxBytes int64
+	// ImageMaxUploadBytes caps the decoded size of a picture a caller submits
+	// for editing. The inbound body carries it base64-encoded (4/3 larger) and
+	// the decoded copy is held while it is uploaded, so this bounds the two
+	// largest allocations of an image-edit turn.
+	ImageMaxUploadBytes int
+	// ChatMaxBodyBytes caps the inbound /v1/chat/completions body. It must be
+	// large enough for a base64 image, which is why it exceeds the text budget:
+	// a text request is externalized to an attachment long before this.
+	ChatMaxBodyBytes int
 	// PrefixCacheTTLSec bounds how long an uploaded history attachment may be
 	// reused. An expired Qwen file_id does not error — the model just answers
 	// without it — so reuse is capped by the document's own lifetime.
@@ -63,6 +72,8 @@ func defaultConfig() config {
 		MaxConcurrent:         8,
 		ImageMaxConcurrent:    2,
 		ImageMaxBytes:         8 << 20,
+		ImageMaxUploadBytes:   4 << 20,
+		ChatMaxBodyBytes:      8 << 20,
 		PrefixCacheTTLSec:     1800,
 		PrefixCacheMaxEntries: 8,
 		LogLevel:              "INFO",
@@ -112,6 +123,18 @@ func loadConfig() (config, error) {
 		var n int64
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			c.ImageMaxBytes = n
+		}
+	}
+	if v := os.Getenv("IMAGE_MAX_UPLOAD_BYTES"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			c.ImageMaxUploadBytes = n
+		}
+	}
+	if v := os.Getenv("CHAT_MAX_BODY_BYTES"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			c.ChatMaxBodyBytes = n
 		}
 	}
 	if v := os.Getenv("AGENT_CONTEXT_PREFIX_TTL_SECONDS"); v != "" {
